@@ -1,0 +1,210 @@
+// s3cfg.nv — where the bucket is, who is asking, and how the two are
+// spelled into a URL.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  Building a configuration reads no file and no
+// environment variable, on purpose.  A library that read
+// `AWS_ACCESS_KEY_ID` for its caller decides, for every program that
+// links it, that an environment variable is a credential source — and
+// that decision belongs to the program, which may be a server with a
+// metadata endpoint, a CLI with a profile file, or a test with a
+// literal.  `s3client.credentials_from_env` is the one function that
+// reads them and it is `[io]` and opt-in.
+//
+// ADDRESSING IS IN THE VALUE BECAUSE IT CHANGES THE SIGNATURE.  A
+// virtual-host request puts the bucket in the Host header and signs a
+// canonical URI of `/key`; a path-style request puts it in the path and
+// signs `/bucket/key`.  Sign one and send the other and the service
+// answers `SignatureDoesNotMatch` — a 403 that reads exactly like a
+// wrong secret key and sends everybody to check their credentials
+// first.  So the style is a field, `s3cfg.canonical_path` is the one
+// function that spells it, and `addressing_for` says when the caller's
+// choice cannot be honoured.
+//
+// THREE SERVICES, THREE FIELDS.  AWS, MinIO and Cloudflare R2 differ in
+// a hostname, a region string and an addressing style, and nothing
+// else this package touches — which is what `aws`, `minio` and `r2`
+// demonstrate rather than assert.
+
+// How a bucket reaches the wire.
+pub enum S3Addressing
+    // `https://<bucket>.s3.<region>.amazonaws.com/<key>`.  What AWS
+    // wants, and what a bucket whose name contains a dot cannot use
+    // over TLS: the wildcard certificate covers one label, so
+    // `my.bucket.s3.amazonaws.com` is a hostname the certificate does
+    // not match and the connection fails before any signature is
+    // checked.
+    S3VirtualHost
+    // `https://<endpoint>/<bucket>/<key>`.  What MinIO serves by
+    // default, what a bucket with a dot in its name needs, and what
+    // every localhost test rig uses.
+    S3PathStyle
+
+// One endpoint.
+pub struct S3Endpoint
+    // `https` or `http`, lowercased.  The scheme is load-bearing and
+    // not cosmetic: `s3sig.payload_allowed` refuses an unsigned payload
+    // over `http`.
+    scheme: Str
+    host: Str
+    port: Int
+    addressing: S3Addressing
+
+// The three strings a signature is computed from.
+//
+// `session_token` is EMPTY when there is none, rather than a `?Str`,
+// because the token is a header that is either present or absent and a
+// nested optional inside a struct that is copied into every request is
+// a shape this package does not need.  Temporary credentials without
+// the token are the failure that looks like a wrong secret: the key and
+// the secret are right, and the service has never heard of the pair.
+pub struct S3Credentials
+    access_key_id: Str
+    secret_access_key: Str
+    session_token: Str
+
+// Everything a request needs that is not the request.
+pub struct S3Config
+    endpoint: S3Endpoint
+    // The region string in the credential scope.  `us-east-1` for AWS's
+    // oldest buckets, whatever MinIO was started with, and `auto` for
+    // R2 — which signs against a region name that names no region, and
+    // works, because the scope is a string both sides agree on rather
+    // than a place.
+    region: Str
+    credentials: S3Credentials
+    // The service name in the credential scope, `s3`.  A field rather
+    // than a constant so the same signer serves an endpoint that signs
+    // as something else without a second copy of SigV4.
+    service: Str
+
+// AWS in one region, virtual-host addressed.
+//
+// ```novo
+// use s3cfg
+//
+// fn cfg(c: S3Credentials) -> S3Config
+//     s3cfg.aws("eu-north-1", c)
+// ```
+pub fn aws(region: Str, creds: S3Credentials) -> S3Config []
+    todo("s3-nv.s3cfg.aws")
+
+// A MinIO deployment: path-style, a plain host and port, and whatever
+// region it was started with.
+//
+// Path-style is not a preference here — MinIO serves virtual-host
+// addressing only when it is told a domain to carve buckets out of, and
+// a fresh deployment has not been.
+//
+// ```novo
+// use s3cfg
+//
+// fn cfg(c: S3Credentials) -> S3Config
+//     s3cfg.minio("http", "127.0.0.1", 9000, "us-east-1", c)
+// ```
+pub fn minio(scheme: Str, host: Str, port: Int, region: Str, creds: S3Credentials) -> S3Config []
+    todo("s3-nv.s3cfg.minio")
+
+// Cloudflare R2 for one account.
+//
+// The region is `auto` and the endpoint is
+// `<account>.r2.cloudflarestorage.com`.  R2 accepts both addressing
+// styles; this returns path-style, because an R2 bucket name is
+// allowed characters AWS is not and the virtual-host spelling of some
+// of them is not a hostname.
+pub fn r2(account_id: Str, creds: S3Credentials) -> S3Config []
+    todo("s3-nv.s3cfg.r2")
+
+// An endpoint from a URL a caller already holds.
+//
+// The addressing style is the caller's answer and not derived from the
+// URL, because there is nothing in `https://example.com` that says
+// which one the server implements.
+pub fn endpoint_of_url(href: Str, style: S3Addressing) -> Result<S3Endpoint, S3Fault> []
+    todo("s3-nv.s3cfg.endpoint_of_url")
+
+// Credentials with no session token.
+pub fn credentials(access_key_id: Str, secret: Str) -> S3Credentials []
+    todo("s3-nv.s3cfg.credentials")
+
+// Credentials with a session token, for a role a caller assumed.
+pub fn temporary_credentials(access_key_id: Str, secret: Str, token: Str) -> S3Credentials []
+    todo("s3-nv.s3cfg.temporary_credentials")
+
+// The same configuration against a different addressing style.
+pub fn with_addressing(cfg: S3Config, style: S3Addressing) -> S3Config []
+    todo("s3-nv.s3cfg.with_addressing")
+
+// The same configuration in a different region.
+pub fn with_region(cfg: S3Config, region: Str) -> S3Config []
+    todo("s3-nv.s3cfg.with_region")
+
+// The `Host` header value a request to this bucket carries.
+//
+// Virtual-host addressing puts the bucket here, which is why the
+// header is part of the signature and why getting the style wrong
+// fails the signature rather than the routing.  The port is included
+// only when it is not the scheme's default, because a `Host` that
+// spells `:443` and a signature computed without it do not match.
+pub fn host_header(cfg: S3Config, bucket: Str) -> Result<Str, S3Fault> []
+    todo("s3-nv.s3cfg.host_header")
+
+// The path a request to this bucket and key is sent on, unencoded.
+//
+// `/key` under virtual-host addressing and `/bucket/key` under
+// path-style.  This is the string `s3sig.canonical_uri` encodes, and
+// keeping the two apart is what lets a test assert the path and the
+// encoding separately.
+pub fn canonical_path(cfg: S3Config, bucket: Str, key: Str) -> Result<Str, S3Fault> []
+    todo("s3-nv.s3cfg.canonical_path")
+
+// The origin a transport dials: scheme, host and port as one string.
+pub fn origin(cfg: S3Config, bucket: Str) -> Result<Str, S3Fault> []
+    todo("s3-nv.s3cfg.origin")
+
+// Whether the caller's addressing choice can be honoured for this
+// bucket, and what it becomes when it cannot.
+//
+// Answers the style that will actually be used.  A dotted bucket name
+// over `https` becomes `S3PathStyle` whatever the configuration says,
+// because the alternative is a certificate error the caller reads as a
+// network problem.  Published, rather than applied silently, because a
+// caller that signed a URL for somebody else needs to know which
+// spelling that URL is in.
+//
+// ```novo
+// use s3cfg
+//
+// fn style(c: S3Config, b: Str) -> S3Addressing
+//     s3cfg.addressing_for(c, b)
+// ```
+pub fn addressing_for(cfg: S3Config, bucket: Str) -> S3Addressing []
+    todo("s3-nv.s3cfg.addressing_for")
+
+// Whether a bucket name is one S3 will accept.
+//
+// The rules that bite: three to sixty-three characters, lowercase
+// letters, digits, dots and hyphens only, starting and ending
+// alphanumeric, not formatted as an IP address, and no `..`.  A name
+// that fails here fails at the service with `InvalidBucketName` after
+// a round trip and a signature.
+pub fn bucket_name_ok(name: Str) -> Bool []
+    todo("s3-nv.s3cfg.bucket_name_ok")
+
+// Whether a key is one that can be signed and sent.
+//
+// Non-empty and at most 1024 bytes of UTF-8.  Every OTHER byte is
+// legal — a key may contain a newline, a `#`, a space, or a sequence
+// that is not valid UTF-8 at all — which is the reason `s3sig` encodes
+// keys with an explicit set rather than trusting a URL parser to
+// round-trip one.
+pub fn key_ok(key: Str) -> Bool []
+    todo("s3-nv.s3cfg.key_ok")
+
+// Whether the endpoint is plaintext.
+//
+// One call, because three different modules ask it and each of them
+// refuses something over it.
+pub fn is_plaintext(cfg: S3Config) -> Bool []
+    todo("s3-nv.s3cfg.is_plaintext")

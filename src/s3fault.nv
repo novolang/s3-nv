@@ -1,0 +1,243 @@
+// s3fault.nv — what can go wrong, as values a caller holds.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  Nothing in this module reads, writes or waits.
+//
+// THE STATUS CODE IS NOT THE ANSWER, AND THIS IS THE MODULE THAT SAYS
+// SO.  S3 answers 403 for four unrelated things — wrong key, wrong
+// signature, a clock more than fifteen minutes out, and a bucket policy
+// that refuses — and the only way to tell them apart is the `<Code>`
+// element inside the body.  A client that reported the status handed
+// its user "403 Forbidden" for a laptop whose clock had drifted, which
+// is a support ticket rather than a fix.  So a fault carries the parsed
+// document, `S3ErrorCode` is an enum with `S3OtherCode` for the rest,
+// and `fix_hint` writes the one sentence that names the actual repair.
+//
+// RETRY IS A PROPERTY OF THE CODE AND NOT OF THE CLASS.  `SlowDown`
+// and `InternalError` are 5xx-shaped and want a backoff; `AccessDenied`
+// wants none, ever, and a client that retried a 403 five times is a
+// client that gets an account rate-limited for asking the same
+// forbidden question repeatedly.  `is_retryable` is the one table.
+
+// The `<Code>` element of an S3 error document.
+//
+// The variants are the codes a client changes its behaviour over.
+// Every other code an implementation invents — and MinIO, Ceph and R2
+// each invent some — arrives as `S3OtherCode` carrying the string, so
+// nothing is lost and nothing is guessed at.
+pub enum S3ErrorCode
+    // The bucket does not exist, or is not visible to these
+    // credentials.  Indistinguishable from the outside, on purpose:
+    // S3 will not confirm that somebody else's bucket exists.
+    S3NoSuchBucket
+    // The key does not exist.  404, and the ONE 404 a caller usually
+    // wants to treat as an ordinary answer rather than a failure.
+    S3NoSuchKey
+    // The multipart upload id is unknown — it completed, it was
+    // aborted, or the lifecycle rule swept it.
+    S3NoSuchUpload
+    // A policy refused.  Never retried.
+    S3AccessDenied
+    // The computed signature did not match.  Almost always an
+    // addressing-style mismatch or an unencoded character in the key
+    // rather than a wrong secret — `fix_hint` says so.
+    S3SignatureDoesNotMatch
+    // The access key id is not one this endpoint knows.
+    S3InvalidAccessKeyId
+    // The request's `x-amz-date` is more than fifteen minutes from the
+    // server's clock.  A 403 whose repair is NTP and not credentials,
+    // which is the whole argument for ntp-nv's row.
+    S3RequestTimeTooSkewed
+    // A multipart part below the five-mebibyte floor, reported at
+    // COMPLETE — after every byte was already uploaded and paid for.
+    // `s3mpu.plan_parts` is what stops this happening.
+    S3EntityTooSmall
+    // Above the five-gibibyte single-PUT ceiling, or the part ceiling.
+    S3EntityTooLarge
+    // A part number or ETag in the completion list that does not match
+    // an uploaded part.
+    S3InvalidPart
+    // The completion list is not in ascending part-number order.
+    S3InvalidPartOrder
+    // An `If-Match` or `If-Unmodified-Since` condition failed.  412,
+    // and the answer a compare-and-swap over an object is built on.
+    S3PreconditionFailed
+    // Slow down: the prefix is being written faster than it partitions.
+    // Retryable, with a backoff, and the fault that decides whether a
+    // bulk upload finishes.
+    S3SlowDown
+    // The service failed.  Retryable.
+    S3InternalError
+    // `CreateBucket` on a bucket these credentials already own.  An
+    // error in the protocol and a success in almost every caller, which
+    // is why it is named rather than folded into `S3OtherCode`.
+    S3BucketAlreadyOwnedByYou
+    // The bucket name is not one this endpoint will accept.
+    S3InvalidBucketName
+    // The `Range` header asked for bytes past the end of the object.
+    S3InvalidRange
+    // The request body was not the XML the operation required.
+    S3MalformedXml
+    // Everything else, carrying the code exactly as it arrived.
+    S3OtherCode(code: Str)
+
+// One S3 `<Error>` document.
+//
+// `request_id` and `host_id` are here because they are what a support
+// request quotes; a client that dropped them makes its user reproduce
+// the failure to get them back.
+pub struct S3ErrorDoc
+    code: S3ErrorCode
+    // The service's own sentence.  Displayed, never matched on: it is
+    // prose and it changes.
+    message: Str
+    // The bucket and key the service says the request named, which is
+    // how an addressing-style mistake becomes visible.
+    resource: Str
+    // `x-amz-request-id`.
+    request_id: Str
+    // `x-amz-id-2`.
+    host_id: Str
+
+// What went wrong, from the caller's side of the call.
+pub enum S3Fault
+    // The service answered a status outside 2xx, with the document it
+    // carried.  A 404 with `S3NoSuchKey` is this, not a `None`: the
+    // difference between "absent" and "you may not ask" is a policy
+    // question and collapsing it hides half of it.
+    S3FaultService(status: Int, doc: S3ErrorDoc)
+    // The transport failed before a status arrived.
+    S3FaultTransport(detail: Str)
+    // The endpoint could not be read as a URL, or named a scheme this
+    // package has no transport for.
+    S3FaultBadEndpoint(detail: Str)
+    // An unsigned payload was asked for over a plaintext endpoint.
+    // Refused rather than warned: `UNSIGNED-PAYLOAD` removes the only
+    // integrity check on the body, and over `http://` there is then
+    // nothing at all between the caller and a rewritten object.
+    S3FaultUnsignedOverPlaintext(endpoint: Str)
+    // A presign asked for a lifetime past the seven-day ceiling SigV4
+    // puts on a signature.  The service answers 403 to such a URL, so
+    // refusing at the signer is the difference between a failure the
+    // caller sees now and one their user sees in a week.
+    S3FaultPresignTooLong(seconds: Int)
+    // A part below the floor, caught before it was uploaded.
+    S3FaultPartTooSmall(part: Int, size: Int)
+    // A completion list out of ascending order.
+    S3FaultPartOutOfOrder(part: Int, after: Int)
+    // The reply's body was shorter than its `Content-Length`.  A
+    // truncation, and never an empty read: an object that arrives short
+    // and is stored is corruption that nothing downstream notices.
+    S3FaultTruncatedBody(want: Int, got: Int)
+    // The XML did not parse, or did not carry the element the
+    // operation's reply is defined by.
+    S3FaultBadXml(detail: Str)
+    // The endpoint is `https://` and this package's shipped transport
+    // is plaintext-only.  See the README: `std.http`'s TLS path covers
+    // GET and POST and answers no headers, and an object store needs
+    // PUT, DELETE, HEAD and the ETag.
+    S3FaultNoTlsTransport(endpoint: Str)
+    // A key that cannot be signed for — an empty key, or one past the
+    // 1024-byte ceiling.
+    S3FaultBadKey(key: Str)
+
+// The code an `<Error>` document's `<Code>` string names.
+//
+// An unknown string is `S3OtherCode` and never a failure: a service
+// that invented a code has still told the caller something, and a
+// parser that refused it would turn a readable error into an
+// unreadable one.
+//
+// ```novo
+// use s3fault
+//
+// fn is_missing(s: Str) -> Bool
+//     match s3fault.code_of_text(s)
+//         S3NoSuchKey => true
+//         _           => false
+// ```
+pub fn code_of_text(code: Str) -> S3ErrorCode []
+    todo("s3-nv.s3fault.code_of_text")
+
+// The string a code is written as on the wire.
+pub fn code_text(code: S3ErrorCode) -> Str []
+    todo("s3-nv.s3fault.code_text")
+
+// Whether a code is worth sending again.
+//
+// The table, and the reason it is a table: `SlowDown`, `InternalError`
+// and `RequestTimeTooSkewed` want another attempt — the first two after
+// a backoff, the third after the clock is corrected — and everything
+// else does not.  A client that retried `AccessDenied` asks a
+// forbidden question five times and gets noticed for it.
+//
+// ```novo
+// use s3fault
+//
+// fn again(c: S3ErrorCode) -> Bool
+//     s3fault.is_retryable(c)
+// ```
+pub fn is_retryable(code: S3ErrorCode) -> Bool []
+    todo("s3-nv.s3fault.is_retryable")
+
+// Whether a fault is worth sending again, transport failures included.
+//
+// Wider than `is_retryable`: a connection reset before any status
+// arrived is retryable for an idempotent request and is not a code at
+// all.  `idempotent` is the caller's answer about the REQUEST, because
+// this module cannot know whether a second `PUT` of the same key is
+// harmless — it is, for an object store, and it is not for a caller
+// that computed the key from a counter.
+pub fn fault_is_retryable(f: S3Fault, idempotent: Bool) -> Bool []
+    todo("s3-nv.s3fault.fault_is_retryable")
+
+// The sentence that names the repair, or empty when there is none.
+//
+// This exists because three of S3's commonest failures have repairs
+// that the service's own message does not mention.  A
+// `SignatureDoesNotMatch` is almost never a wrong secret — it is
+// path-style addressing sent to a virtual-host endpoint, or a key
+// containing a character that was encoded once too often.  A
+// `RequestTimeTooSkewed` is a clock.  An `AccessDenied` on a HEAD of a
+// key that exists is a missing `s3:ListBucket`, which is why the same
+// account can GET the object and cannot HEAD it.
+pub fn fix_hint(doc: S3ErrorDoc) -> Str []
+    todo("s3-nv.s3fault.fix_hint")
+
+// An empty document, for a status that carried no body at all.
+//
+// A 304 and a HEAD's 404 have no body by definition, so the fault for
+// one is a `S3FaultService` over this rather than a parse failure.
+pub fn empty_doc(status: Int) -> S3ErrorDoc []
+    todo("s3-nv.s3fault.empty_doc")
+
+// Whether a fault is a plain "the key is not there".
+//
+// Published as one call because it is the commonest branch a caller
+// writes and because getting it right means checking the code and not
+// the status: a 404 with `NoSuchBucket` is not a missing key.
+//
+// ```novo
+// use s3fault
+//
+// fn absent(f: S3Fault) -> Bool
+//     s3fault.is_no_such_key(f)
+// ```
+pub fn is_no_such_key(f: S3Fault) -> Bool []
+    todo("s3-nv.s3fault.is_no_such_key")
+
+// What went wrong, in one line.
+//
+// A value with a `message()`, and not a printed line: the caller
+// decides whether their program says anything at all.
+//
+// ```novo
+// use s3fault
+//
+// fn report(f: S3Fault) -> Str
+//     f.message()
+// ```
+impl Error for S3Fault
+    fn message(self) -> Str
+        todo("s3-nv.s3fault.S3Fault.message")

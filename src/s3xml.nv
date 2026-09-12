@@ -1,0 +1,196 @@
+// s3xml.nv — the XML S3 answers in, read over xml-nv's tree.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  A parse is a parse.
+//
+// THIS MODULE PARSES NO XML.  xml-nv builds the tree; every function
+// here is a walk over it that knows which elements S3's replies are
+// defined by.  The split is why an S3 reply this package has never seen
+// still parses — a new element is a node nobody read, not a failure.
+//
+// NAMESPACES ARE MATCHED AND NOT IGNORED.  Every S3 reply is in
+// `http://s3.amazonaws.com/doc/2006-03-01/`, and every
+// S3-COMPATIBLE service copies that namespace exactly, including the
+// ones that have never been near AWS.  A reader that matched on local
+// names alone would accept an error document from a captive portal or
+// a proxy that answers XML of its own — which is how a 200 from a
+// hotel wifi becomes an object with plausible contents.
+//
+// AND `<Key>` IS URL-ENCODED WHEN THE REQUEST ASKED FOR IT.
+// ListObjectsV2 takes `encoding-type=url`, which is the ONLY way a key
+// containing a character XML cannot carry survives the reply at all.
+// So this package always asks for it and `list_result` always decodes,
+// and `S3ListPage.encoding` records which it was so a caller reading
+// raw XML elsewhere is not misled.
+
+// One object in a listing.
+pub struct S3ListEntry
+    // The key, already decoded when the listing was URL-encoded.
+    key: Str
+    // RFC 3339, as the reply wrote it.
+    last_modified: Str
+    // With its quotes, as it arrived: an ETag's quotes are part of the
+    // value in every header that carries one, and a reader that
+    // stripped them here produces a value that does not compare equal
+    // to the one a HEAD returns.
+    etag: Str
+    size: Int
+    // `STANDARD`, `GLACIER`, and whatever a compatible service calls
+    // its tiers.
+    storage_class: Str
+
+// One page of a listing.
+pub struct S3ListPage
+    // The objects, in the order the reply gave them — which is
+    // lexicographic by key, and is the property a caller resuming a
+    // scan depends on.
+    entries: [S3ListEntry]
+    // The common prefixes a delimiter rolled up: the "directories".
+    prefixes: [Str]
+    // WHAT ENDS THE LOOP.  Not an empty `entries` — a page can
+    // legitimately contain no objects and still be truncated, when
+    // every key in its range rolled up into `prefixes` or was filtered
+    // out.  A caller that stopped on an empty page silently skips the
+    // rest of the bucket.
+    is_truncated: Bool
+    // The token the next request sends as `continuation-token`.
+    // Present exactly when `is_truncated` is true; a service that
+    // disagrees with itself is `S3FaultBadXml`.
+    next_continuation: ?Str
+    // How many keys this page holds, as the reply counted them.
+    key_count: Int
+    // The prefix and delimiter the reply echoed, which is how a caller
+    // confirms the service honoured them — some compatible services
+    // ignore `delimiter` and answer every key.
+    prefix: Str
+    delimiter: Str
+    // Whether the keys in this page arrived URL-encoded.
+    encoding: Bool
+
+// The result of initiating a multipart upload.
+pub struct S3UploadStart
+    bucket: Str
+    key: Str
+    // The opaque id every subsequent part and the completion carry.
+    upload_id: Str
+
+// One uploaded part, as `ListParts` reports it.
+pub struct S3PartInfo
+    // One-based.  S3 numbers parts from 1, and a zero part number is a
+    // 400 that reads like a malformed request.
+    part_number: Int
+    etag: Str
+    size: Int
+    last_modified: Str
+
+// The result of completing a multipart upload.
+pub struct S3UploadDone
+    location: Str
+    bucket: Str
+    key: Str
+    // The composite ETag: see `s3op.etag_is_multipart`.  It is NOT the
+    // MD5 of the object.
+    etag: Str
+
+// One object's outcome in a batch delete.
+pub struct S3DeleteOutcome
+    key: Str
+    // Empty when the delete succeeded.
+    code: Str
+    message: Str
+
+// Whether a document is in the S3 namespace.
+//
+// The first check every reader here makes.  A document that is not is
+// `S3FaultBadXml` naming what it was, because the alternative is
+// reading a proxy's error page as a listing with no objects in it.
+pub fn is_s3_document(doc: XmlDocument) -> Bool []
+    todo("s3-nv.s3xml.is_s3_document")
+
+// An `<Error>` document.
+//
+// The one reply shape this package reads on a FAILURE path, which is
+// why it never fails itself: a body that is not an error document
+// answers an `S3ErrorDoc` with `S3OtherCode("")` and the body's first
+// line as the message, because a client that could not report a
+// failure because the failure was malformed has reported nothing.
+//
+// ```novo
+// use s3fault
+// use s3xml
+//
+// fn code(b: Bytes) -> S3ErrorCode
+//     s3xml.error_doc(b).code
+// ```
+pub fn error_doc(body: Bytes) -> S3ErrorDoc []
+    todo("s3-nv.s3xml.error_doc")
+
+// A `ListBucketResult`.
+pub fn list_result(body: Bytes) -> Result<S3ListPage, S3Fault> []
+    todo("s3-nv.s3xml.list_result")
+
+// An `InitiateMultipartUploadResult`.
+pub fn upload_start(body: Bytes) -> Result<S3UploadStart, S3Fault> []
+    todo("s3-nv.s3xml.upload_start")
+
+// A `CompleteMultipartUploadResult`.
+//
+// THIS REPLY CAN BE A 200 THAT FAILED.  S3 answers 200 as soon as it
+// starts the completion and then streams whitespace until it finishes,
+// which can be minutes; if the completion then fails, the error
+// document arrives inside that 200 body.  A client that checked the
+// status and stopped reports a successful upload that does not exist.
+// So this answers `S3FaultService` for a body that turns out to be an
+// `<Error>`, and `s3op.body_is_error` is the same check spelled for a
+// caller reading the body itself.
+pub fn upload_done(body: Bytes) -> Result<S3UploadDone, S3Fault> []
+    todo("s3-nv.s3xml.upload_done")
+
+// A `ListPartsResult`.
+pub fn list_parts(body: Bytes) -> Result<[S3PartInfo], S3Fault> []
+    todo("s3-nv.s3xml.list_parts")
+
+// Whether a `ListPartsResult` says there are more parts.
+pub fn parts_truncated(body: Bytes) -> Result<Bool, S3Fault> []
+    todo("s3-nv.s3xml.parts_truncated")
+
+// A `DeleteResult` from a batch delete.
+//
+// Every outcome, deleted and failed alike, because a batch delete
+// answers 200 with per-key failures inside it — and a caller that read
+// the status concluded that a thousand objects were removed when
+// nine hundred were.
+pub fn delete_result(body: Bytes) -> Result<[S3DeleteOutcome], S3Fault> []
+    todo("s3-nv.s3xml.delete_result")
+
+// A `CopyObjectResult`, which carries the new ETag.
+pub fn copy_result(body: Bytes) -> Result<Str, S3Fault> []
+    todo("s3-nv.s3xml.copy_result")
+
+// The `CompleteMultipartUpload` request document.
+//
+// Written here rather than in `s3mpu` because it is the one request
+// body in the package that is XML, and the writer belongs beside the
+// readers it has to agree with.  The parts must be in ascending
+// order; `s3mpu.completion` is what sorts them.
+pub fn write_completion(parts: [S3PartInfo]) -> Bytes []
+    todo("s3-nv.s3xml.write_completion")
+
+// The `Delete` request document for a batch delete.
+//
+// `quiet` suppresses the successful entries in the reply, which for a
+// thousand-key delete is the difference between a reply worth reading
+// and one that is mostly noise.
+pub fn write_delete(keys: [Str], quiet: Bool) -> Bytes []
+    todo("s3-nv.s3xml.write_delete")
+
+// The `CreateBucketConfiguration` document.
+//
+// EMPTY FOR `us-east-1`, and that is not an optimisation.  S3 refuses a
+// `CreateBucket` that names `us-east-1` in this document — the region
+// that predates the document is the one it may not mention — so a
+// client that always wrote it cannot create a bucket in the oldest
+// region.
+pub fn write_bucket_config(region: Str) -> Bytes []
+    todo("s3-nv.s3xml.write_bucket_config")

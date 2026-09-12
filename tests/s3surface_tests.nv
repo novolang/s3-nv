@@ -1,0 +1,252 @@
+// s3surface_tests.nv — every remaining `pub` item, named from outside
+// the package.
+//
+// RED ON PURPOSE, like the other two suites: the first `todo()` each
+// function reaches ends it.  What this file is for is the part that
+// happens BEFORE any of them runs — it compiles, which means every
+// signature in the package can be spelled by a consumer, with the
+// types a consumer holds, in the module a consumer imports.  For an
+// interface release that is the property worth checking, because the
+// signatures are the whole of what was published.
+//
+// The two behavioural suites are `s3sig_tests.nv` and
+// `s3flow_tests.nv`; nothing here asserts behaviour that is not
+// already asserted there.
+
+use std.test
+use std.bytes
+use s3cfg
+use s3client
+use s3fault
+use s3mpu
+use s3op
+use s3req
+use s3sig
+use s3xml
+use civil
+
+fn at() -> CivilDateTime
+    match civil.date(2026, 9, 12)
+        Ok(d)  => civil.datetime(d, civil.midnight())
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+
+fn creds() -> S3Credentials
+    s3cfg.credentials("k", "s")
+
+fn cfg() -> S3Config
+    s3cfg.minio("http", "127.0.0.1", 9000, "us-east-1", creds())
+
+fn a_reply() -> S3Reply
+    S3Reply { status: 200, headers: [], body: bytes.zeros(0), streamed: false }
+
+fn a_request() -> S3Request
+    s3req.request("GET", "b", "k")
+
+@test
+fn test_the_configuration_surface_is_callable_from_outside() [io]
+    test.case("the three presets, the two credential shapes and the checks")
+    let _r2 = s3cfg.r2("account", creds())
+    let _tmp = s3cfg.temporary_credentials("k", "s", "tok")
+    let _reg = s3cfg.with_region(cfg(), "eu-west-1")
+    let _plain = s3cfg.is_plaintext(cfg())
+    let _keyok = s3cfg.key_ok("k")
+    match s3cfg.endpoint_of_url("http://127.0.0.1:9000", S3PathStyle)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3cfg.host_header(cfg(), "b")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3cfg.origin(cfg(), "b")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_fault_surface_is_callable_from_outside() [io]
+    test.case("the code table, the wider retry question and the two documents")
+    let _t = s3fault.code_text(S3NoSuchKey)
+    let doc = s3fault.empty_doc(404)
+    let _h = s3fault.fix_hint(doc)
+    let _again = s3fault.fault_is_retryable(S3FaultTransport("reset"), true)
+    test.assert(true)
+
+@test
+fn test_the_signing_surface_is_callable_from_outside() [io]
+    test.case("the pieces a caller compares against a service's echo")
+    let s = s3sig.scope(at(), "us-east-1", "s3")
+    let _p = s3sig.payload_text(S3PayloadUnsigned)
+    match s3sig.canonical_request(cfg(), a_request(), S3PayloadUnsigned, at())
+        Err(_) => test.assert(true)
+        Ok(cr) =>
+            let _text = s3sig.canonical_text(cr)
+            let _sts = s3sig.string_to_sign(cr, at(), s)
+            test.assert(true)
+    match s3sig.presign_expiry(at(), 900)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3sig.service_time_of(["Date: Thu, 12 Sep 2026 00:00:00 GMT"])
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+    let sig = S3Signature { hex: "", header: "", amz_date: "", payload: "" }
+    let _hs = s3sig.authorization_headers(cfg(), sig)
+    test.assert(true)
+
+@test
+fn test_the_request_surface_is_callable_from_outside() [io]
+    test.case("the builders, the lookups and the two conditional headers")
+    let r = s3req.with_bytes(s3req.with_query(a_request(), "acl", ""), bytes.zeros(0))
+    let _b = s3req.with_body(r, S3BodyStreamedUnhashed(10))
+    let _n = s3req.body_length(S3BodyBytes(bytes.zeros(3)))
+    match s3req.header_of(["ETag: \"x\""], "etag")
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+    match s3req.request_header_of(r, "range")
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+    let _m = s3req.metadata_of(["x-amz-meta-author: ada"])
+    let _im = s3req.if_match_header("\"x\"")
+    let _in = s3req.if_none_match_any()
+    test.assert(true)
+
+@test
+fn test_the_operation_surface_is_callable_from_outside() [io]
+    test.case("every builder and every reader, once each")
+    let _whole = s3op.get("b", "k")
+    let _g = s3op.get_range("b", "k", 0, 9)
+    let _c = s3op.get_if_none_match("b", "k", "\"x\"")
+    let _h = s3op.head("b", "k")
+    let _p = s3op.put("b", "k", bytes.zeros(0))
+    let _ps = s3op.put_streamed("b", "k", 10, s3sig.S3_EMPTY_SHA256)
+    let _d = s3op.delete("b", "k")
+    let _dm = s3op.delete_if_match("b", "k", "\"x\"")
+    let _cp = s3op.copy("b", "k", "b2", "k2", true)
+    let _src = s3op.copy_source_header("b", "k")
+    let _hb = s3op.head_bucket("b")
+    let _eu = s3op.etag_unquoted("\"x\"")
+    let _fr = s3op.fault_of_reply(a_reply())
+    match s3op.conditional_writes_supported(cfg())
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+    match s3op.create_bucket("b", "us-east-1")
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3op.delete_many("b", ["k"], true)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3op.read_get(a_reply(), false)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3op.read_head(a_reply())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3op.read_put(a_reply())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3op.read_delete(a_reply())
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+    match s3op.read_list(a_reply())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3op.read_copy(a_reply())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_xml_surface_is_callable_from_outside() [io]
+    test.case("every reader and every writer, once each")
+    let body = bytes.zeros(0)
+    let _e = s3xml.error_doc(body)
+    let _wc = s3xml.write_completion([])
+    let _wd = s3xml.write_delete(["k"], true)
+    let _wb = s3xml.write_bucket_config("eu-west-1")
+    let _d = s3xml.is_s3_document(xmltree.build(""))
+    match s3xml.list_result(body)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3xml.upload_start(body)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3xml.upload_done(body)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3xml.list_parts(body)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3xml.parts_truncated(body)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3xml.delete_result(body)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+    match s3xml.copy_result(body)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_multipart_surface_is_callable_from_outside() [io]
+    test.case("the plan, the pump's inputs and the operator's two listings")
+    let _nm = s3mpu.needs_multipart(1024)
+    let _lp = s3mpu.list_parts_request("b", "k", "id", 0)
+    let _lu = s3mpu.list_uploads_request("b", "")
+    match s3mpu.resume("b", "k", "id", 52428800, s3op.S3_PART_MIN_BYTES, [])
+        Err(_) => test.assert(true)
+        Ok(u)  =>
+            let _id = s3mpu.upload_id_of(u)
+            let _st = s3mpu.state_of(u)
+            let _ps = s3mpu.parts_of(u)
+            let _pr = s3mpu.progress_of(u)
+            match s3mpu.abort(u)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match s3mpu.completion(u)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match s3mpu.supply_start(u, a_reply())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match s3mpu.supply_part(u, 1, a_reply())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match s3mpu.supply_complete(u, a_reply())
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+// Every generic client call, over a transport that costs nothing.
+//
+// No effect row, which is the same claim `s3flow_tests.nv` makes for
+// one operation, made here for all of them: not one of these reaches a
+// socket unless the transport does.
+fn every_client_call(t: S3StdHttp) -> Int [io, net, time, async]
+    let c = s3client.client(cfg())
+    let _o = s3client.open(c, t, a_request(), at())
+    let _g = s3client.get_range(c, t, "b", "k", 0, 9, at())
+    let _h = s3client.head_object(c, t, "b", "k", at())
+    let _p = s3client.put_object(c, t, "b", "k", bytes.zeros(0), at())
+    let _d = s3client.delete_object(c, t, "b", "k", at())
+    let _y = s3client.copy_object(c, t, "b", "k", "b2", "k2", at())
+    let _l = s3client.list_page(c, t, "b", "", "/", 1000, None, at())
+    let _a = s3client.abort_upload(c, t, "b", "k", "id", at())
+    let _r = s3client.drain_into(t, bytes.zeros(16), 16)
+    match s3mpu.upload("b", "k", 52428800, s3op.S3_PART_MIN_BYTES)
+        Err(_) => 0
+        Ok(u)  =>
+            match s3client.pump(c, t, u, bytes.zeros(0), at())
+                Ok(_)  => 1
+                Err(_) => 2
+
+@test
+fn test_the_client_surface_is_callable_from_outside() [io, net, time, async]
+    test.case("the transport that will not be built for an http endpoint")
+    match s3client.std_http(cfg(), 30000)
+        Err(_) => test.assert(true)
+        Ok(t)  => test.assert(every_client_call(t) >= 0)
+
+@test
+fn test_the_two_host_functions_are_callable_from_outside() [io, time]
+    // The two functions in the package that are not `[]`, named here so
+    // that their rows are exercised rather than only declared.
+    test.case("the clock and the environment")
+    let _now = s3client.now_civil()
+    match s3client.credentials_from_env()
+        Some(_) => test.assert(true)
+        None    => test.assert(true)

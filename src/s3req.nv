@@ -1,0 +1,212 @@
+// s3req.nv — a request and a reply as values, before anything sends
+// either.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  A request is built, a reply is read, and neither
+// touches a socket.  That is what lets `tests/s3sig_tests.nv` drive
+// AWS's own published SigV4 test vectors with no network at all.
+//
+// THE BODY IS A PLAN AND NOT BYTES.  `S3Body` has four cases —
+// nothing, bytes the caller holds, a length the caller will stream, and
+// a length it has not hashed — because the ONE thing SigV4 needs from a
+// body before it is sent is its SHA-256, and three of those four cannot
+// supply one without reading the whole thing into memory first.  A
+// request struct with a `Bytes` field would have made a five-gibibyte
+// upload a five-gibibyte allocation, quietly, and the only sign of it
+// would have been a program that stopped working on large objects.
+//
+// HEADERS ARE A LIST OF PAIRS AND NOT A MAP.  SigV4 signs the headers
+// sorted by lowercased name with their values trimmed and their
+// internal runs of whitespace collapsed, and a map that normalised on
+// insertion would have thrown away the distinction between a header
+// that was sent twice and one that carried a comma — which the
+// canonicalisation rule joins differently.  `s3sig.canonical_headers`
+// does the whole normalisation once, where it can be compared against
+// the specification's own worked examples.
+
+// One header, as it will be sent.
+//
+// The name is kept in the case the caller wrote it, because that is
+// what goes on the wire; the signature lowercases its own copy.
+pub struct S3Header
+    name: Str
+    value: Str
+
+// One query parameter, unencoded.
+//
+// Both halves are the raw characters.  Encoding happens once, in
+// `s3sig.canonical_query`, so a value that was already encoded by a
+// caller is a bug this package can see rather than a double-encoded
+// string the service rejects.
+pub struct S3QueryPair
+    name: Str
+    value: Str
+
+// What a request carries as its body.
+pub enum S3Body
+    // No body at all.  GET, HEAD, DELETE.
+    S3BodyNone
+    // Bytes the caller already holds.  The only case whose SHA-256
+    // this package can compute without help.
+    S3BodyBytes(data: Bytes)
+    // `length` bytes the caller will supply to the transport, whose
+    // hash the caller has already computed — from a previous pass over
+    // the file, or from an ETag it trusts.
+    S3BodyStreamed(length: Int, sha256_hex: Str)
+    // `length` bytes the caller will supply and has NOT hashed.  Only
+    // signable as `UNSIGNED-PAYLOAD`, which `s3sig.payload_allowed`
+    // refuses over a plaintext endpoint — so this case is the one that
+    // makes the trade explicit at the call site rather than in a
+    // comment.
+    S3BodyStreamedUnhashed(length: Int)
+
+// One request, ready to be signed.
+pub struct S3Request
+    // Uppercase: `GET`, `PUT`, `HEAD`, `DELETE`, `POST`.
+    method: Str
+    bucket: Str
+    // The key, unencoded.  Empty for a bucket-level operation.
+    key: Str
+    // Query parameters, unencoded and in any order.  Sorting is the
+    // canonicalisation's job.
+    query: [S3QueryPair]
+    // Headers the caller supplies.  `Host`, `x-amz-date`,
+    // `x-amz-content-sha256` and `Authorization` are added by the
+    // signer and must NOT be here: a duplicate `Host` is a signature
+    // that covers a header the service sees twice.
+    headers: [S3Header]
+    body: S3Body
+
+// One reply, as much of it as a transport has.
+pub struct S3Reply
+    status: Int
+    // `Name: value` lines, as they arrived.
+    headers: [Str]
+    // The buffered body.  EMPTY when `streamed` is true.
+    body: Bytes
+    // True when the body was left on the wire for the transport's
+    // reader.  A caller that read `body` instead of draining the
+    // stream gets nothing and no error, which is why `s3op.read_get`
+    // takes the flag rather than guessing.
+    streamed: Bool
+
+// A GET-shaped request with no body.
+pub fn request(method: Str, bucket: Str, key: Str) -> S3Request []
+    todo("s3-nv.s3req.request")
+
+// The same request with one more query parameter.
+pub fn with_query(r: S3Request, name: Str, value: Str) -> S3Request []
+    todo("s3-nv.s3req.with_query")
+
+// The same request with one more header.
+pub fn with_header(r: S3Request, name: Str, value: Str) -> S3Request []
+    todo("s3-nv.s3req.with_header")
+
+// The same request carrying a body.
+pub fn with_body(r: S3Request, body: S3Body) -> S3Request []
+    todo("s3-nv.s3req.with_body")
+
+// The same request carrying bytes.
+pub fn with_bytes(r: S3Request, data: Bytes) -> S3Request []
+    todo("s3-nv.s3req.with_bytes")
+
+// How many bytes a body will send.
+//
+// Zero for `S3BodyNone`, which is what `Content-Length: 0` on a PUT of
+// an empty object needs — and an empty object is a thing S3 stores and
+// a thing a directory-marker convention depends on.
+pub fn body_length(b: S3Body) -> Int []
+    todo("s3-nv.s3req.body_length")
+
+// One header's value, matched without regard to case.
+//
+// HTTP field names are case-insensitive and S3 implementations
+// disagree: AWS answers `ETag`, some gateways answer `Etag`, and a
+// client that compared exactly reads the object's identity from one
+// deployment and not from the next.
+//
+// ```novo
+// use s3req
+//
+// fn etag(h: [Str]) -> ?Str
+//     s3req.header_of(h, "etag")
+// ```
+pub fn header_of(headers: [Str], name: Str) -> ?Str []
+    todo("s3-nv.s3req.header_of")
+
+// One header's value off a request's own list.
+pub fn request_header_of(r: S3Request, name: Str) -> ?Str []
+    todo("s3-nv.s3req.request_header_of")
+
+// The `Range` header for a byte range, inclusive at both ends.
+//
+// `bytes=0-499` is the first five hundred bytes, and the closed
+// interval is HTTP's rather than this package's choice — a half-open
+// spelling here would be one translation nobody remembers to do.
+pub fn range_header(first: Int, last: Int) -> Str []
+    todo("s3-nv.s3req.range_header")
+
+// The `Range` header for everything from an offset onwards.
+pub fn range_from(first: Int) -> Str []
+    todo("s3-nv.s3req.range_from")
+
+// The `Range` header for the last `n` bytes.
+//
+// `bytes=-n`, which is a DIFFERENT thing from `bytes=n-`: the first
+// is a suffix and the second is an offset, and the two differ by one
+// character in a header that nothing validates.
+pub fn range_suffix(n: Int) -> Str []
+    todo("s3-nv.s3req.range_suffix")
+
+// The three numbers a `Content-Range` reply header carries.
+//
+// `bytes 0-499/1234` answers `(0, 499, 1234)`.  The total is what a
+// caller resuming a download needs and the only place the object's
+// full length appears on a ranged GET — `Content-Length` on that reply
+// is the length of the RANGE, and a resumer that read it concludes the
+// object is five hundred bytes long.
+pub fn content_range_of(headers: [Str]) -> ?(Int, Int, Int) []
+    todo("s3-nv.s3req.content_range_of")
+
+// A `Content-Type` for a key, from its extension.
+//
+// mime-nv's table, and the default is `application/octet-stream` only
+// when the extension names nothing.  S3 stores the type it is given
+// and serves it back forever, so a bucket that was uploaded without
+// one serves a website that downloads its own pages instead of
+// rendering them — and fixing it afterwards is a copy of every object.
+pub fn content_type_for(key: Str) -> Str []
+    todo("s3-nv.s3req.content_type_for")
+
+// A user metadata header, `x-amz-meta-<name>`.
+//
+// The name is lowercased on the way in, because S3 lowercases metadata
+// keys on the way out and a caller that stored `Author` and read back
+// `author` has a round trip that silently does not round-trip.
+pub fn metadata_header(name: Str, value: Str) -> S3Header []
+    todo("s3-nv.s3req.metadata_header")
+
+// Every `x-amz-meta-` header in a reply, with the prefix removed.
+pub fn metadata_of(headers: [Str]) -> [S3Header] []
+    todo("s3-nv.s3req.metadata_of")
+
+// Whether a metadata set fits S3's two-kilobyte ceiling.
+//
+// The ceiling counts the names AND the values AND the separators, and
+// exceeding it is a 400 at PUT time — after the body has been sent.
+pub fn metadata_fits(meta: [S3Header]) -> Bool []
+    todo("s3-nv.s3req.metadata_fits")
+
+// The `If-Match` header, for a conditional write.
+//
+// `If-Match` against an ETag is how two writers of the same key stop
+// overwriting each other: the second one's PUT answers 412 instead of
+// winning silently.  Not every S3-compatible service honours it, and
+// `s3op.conditional_writes_supported` is the one that says so.
+pub fn if_match_header(etag: Str) -> S3Header []
+    todo("s3-nv.s3req.if_match_header")
+
+// The `If-None-Match: *` header, for a write that must not replace.
+pub fn if_none_match_any() -> S3Header []
+    todo("s3-nv.s3req.if_none_match_any")

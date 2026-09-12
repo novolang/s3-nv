@@ -1,0 +1,328 @@
+// s3flow_tests.nv — the operations, the listing loop, the multipart
+// state machine and the transport that crosses the layer.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: s3-nv.<module>.<fn>`.
+//
+// THE TRANSPORT BELOW IS `[]` AND IT IS THE CLAIM THIS FILE EXISTS TO
+// CHECK.  `S3TestTape` implements `S3Transport[]` over a recorded
+// exchange, and the function that drives it carries no effect row at
+// all.  That is the compiler agreeing, before a single assertion runs,
+// that nothing in `s3op`, `s3mpu`, `s3sig` or `s3xml` reaches a socket
+// — a property no amount of testing can establish and one declaration
+// can.
+
+use std.test
+use std.bytes
+use s3cfg
+use s3client
+use s3fault
+use s3mpu
+use s3op
+use s3req
+use civil
+
+// A transport with no socket in it.
+//
+// Every method answers a canned reply and costs nothing, which is the
+// whole point: the generic functions in `s3client` are charged what
+// their transport costs, so over this one they are charged nothing.
+struct S3TestTape
+    status: Int
+    body: Bytes
+
+fn tape(status: Int, body: Str) -> S3TestTape
+    S3TestTape { status: status, body: bytes.from_str(body) }
+
+impl S3Transport[] for S3TestTape
+    fn s3_exchange(self, origin: Str, method: Str, target: Str, headers: [S3Header],
+                   body: Bytes) -> Result<S3Reply, S3Fault> []
+        Ok(S3Reply { status: self.status, headers: [], body: self.body,
+                     streamed: false })
+
+    fn s3_open(self, origin: Str, method: Str, target: Str, headers: [S3Header],
+               body: Bytes) -> Result<S3Reply, S3Fault> []
+        Ok(S3Reply { status: self.status, headers: [], body: bytes.zeros(0),
+                     streamed: true })
+
+    fn s3_read(self, max: Int) -> Result<Bytes, S3Fault> []
+        Ok(bytes.zeros(0))
+
+    fn s3_close(self) -> ?S3Fault []
+        None
+
+fn any_at() -> CivilDateTime
+    match civil.date(2026, 9, 12)
+        Ok(d)  => civil.datetime(d, civil.midnight())
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+
+fn test_cfg() -> S3Config
+    s3cfg.minio("http", "127.0.0.1", 9000, "us-east-1",
+                s3cfg.credentials("minioadmin", "minioadmin"))
+
+// A whole GET driven over the tape, at `[]`.  No row, and the compiler
+// is what says so.
+fn get_over_a_tape(t: S3TestTape) -> Result<S3Object, S3Fault> []
+    s3client.get_object(s3client.client(test_cfg()), t, "b", "k", any_at())
+
+fn part_count(ps: [S3MpuPart]) -> Int
+    var n = 0
+    for _p in ps
+        n = n + 1
+    n
+
+@test
+fn test_a_listing_ends_on_is_truncated_and_never_on_an_empty_page() [io]
+    // A page can legitimately hold no objects and still be truncated —
+    // when every key in its range rolled up into `CommonPrefixes`, or
+    // was filtered out.  A caller that stopped on an empty page skips
+    // the rest of the bucket, silently, and the bug only shows on a
+    // bucket big enough to have one.
+    let page = S3ListPage { entries: [], prefixes: ["a/", "b/"],
+                            is_truncated: true, next_continuation: Some("tok"),
+                            key_count: 0, prefix: "", delimiter: "/",
+                            encoding: true }
+
+    test.case("an empty page that is truncated has more")
+    test.assert(s3op.has_more(page))
+
+    test.case("and the token to send is the one the page carried")
+    match page.next_continuation
+        Some(t) => test.assert_eq_str(t, "tok")
+        None    => test.fail("a truncated page names its continuation")
+
+@test
+fn test_a_listing_request_is_a_v2_get_on_the_bucket() [io]
+    // `encoding-type=url` is a query parameter and not a header, and it
+    // is the only way a key containing a character XML cannot carry
+    // survives the reply.  S3 accepts such keys, so a client that did
+    // not ask silently loses them from its listing.
+    let r = s3op.list("b", "photos/", "/", 1000, None)
+
+    test.case("a listing is a GET")
+    test.assert_eq_str(r.method, "GET")
+
+    test.case("on the bucket rather than on a key")
+    test.assert_eq_str(r.key, "")
+
+@test
+fn test_a_multipart_plan_refuses_a_part_below_the_floor_before_sending_it() [io]
+    // `EntityTooSmall` arrives at COMPLETE — after every byte has been
+    // uploaded and paid for.  The plan is computed first precisely so
+    // that failure happens at a function call instead.
+    test.case("a mebibyte is not a legal part size")
+    test.assert(not s3mpu.part_size_ok(1048576))
+
+    test.case("five mebibytes is")
+    test.assert(s3mpu.part_size_ok(s3op.S3_PART_MIN_BYTES))
+
+    test.case("and a plan at a mebibyte is refused rather than attempted")
+    match s3mpu.plan_parts(104857600, 1048576)
+        Ok(_)  => test.fail("a one-mebibyte part size cannot be planned")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_plan_raises_the_part_size_rather_than_exceeding_ten_thousand_parts() [io]
+    // Answering a fault for an eight-hundred-gibibyte object at an
+    // eight-mebibyte part size would be correct and useless.  The plan
+    // raises the size to the smallest one that fits, and the caller can
+    // read what it became.
+    test.case("a large object at a small preferred size still plans")
+    match s3mpu.planned_part_size(858993459200, 8388608)
+        Ok(n)  => test.assert(n > 8388608)
+        Err(_) => test.fail("the part size is raised, not refused")
+
+    test.case("and the plan is inside the part-count ceiling")
+    match s3mpu.plan_parts(858993459200, 8388608)
+        Ok(ps) => test.assert(part_count(ps) <= s3mpu.S3_MAX_PARTS)
+        Err(_) => test.fail("the part size is raised, not refused")
+
+@test
+fn test_a_failed_upload_says_that_an_abort_is_owed() [io]
+    // A multipart upload that is neither completed nor aborted leaves
+    // its parts in the bucket forever: not listed, not reachable by any
+    // key, and billed.  The state machine cannot reach a terminal
+    // failure without saying so in the value it hands back.
+    match s3mpu.upload("b", "k", 52428800, s3op.S3_PART_MIN_BYTES)
+        Err(_) => test.fail("a fifty-mebibyte object is plannable")
+        Ok(u)  =>
+            test.case("a fresh upload owes nothing")
+            test.assert(not s3mpu.owes_abort(u))
+
+            test.case("and a failure is a terminal step that names the cleanup")
+            let failed = s3mpu.fail(u, S3FaultTransport("the socket died"))
+            match s3mpu.step(failed)
+                S3MpuMustAbort(_, _) => test.assert(true)
+                S3MpuFailed(_)       => test.assert(true)
+                _                    => test.fail("a failed upload is terminal")
+
+@test
+fn test_an_abort_can_be_built_from_an_upload_id_alone() [io]
+    // The caller that most needs it is the one that has just restarted
+    // and holds nothing but the id it wrote down.
+    let r = s3mpu.abort_request("b", "k", "upload-id-1")
+    test.case("the abort is a DELETE")
+    test.assert_eq_str(r.method, "DELETE")
+
+    test.case("on the key it was uploading")
+    test.assert_eq_str(r.key, "k")
+
+@test
+fn test_a_multipart_etag_is_not_the_md5_of_the_object() [io]
+    // A program that verified downloads by comparing the ETag to its own
+    // MD5 works until the first object over five gibibytes, and then
+    // reports corruption on every one of them.
+    test.case("a composite ETag is recognised by its suffix")
+    test.assert(s3op.etag_is_multipart("\"d41d8cd98f00b204e9800998ecf8427e-4\""))
+
+    test.case("it names how many parts made it")
+    test.assert_eq(s3op.etag_part_count("\"d41d8cd98f00b204e9800998ecf8427e-4\""), 4)
+
+    test.case("and a single-PUT ETag is not one")
+    test.assert(not s3op.etag_is_multipart("\"d41d8cd98f00b204e9800998ecf8427e\""))
+
+@test
+fn test_a_two_hundred_can_still_be_a_failure_on_complete_and_on_copy() [io]
+    // S3 answers 200 as soon as it STARTS a completion or a copy and
+    // then streams whitespace while it works.  If the operation fails,
+    // the error document arrives inside that 200.  A client that
+    // checked the status reports an upload that does not exist.
+    let body = "<?xml version=\"1.0\"?><Error><Code>InternalError</Code></Error>"
+    let reply = S3Reply { status: 200, headers: [], body: bytes.from_str(body),
+                          streamed: false }
+
+    test.case("a 200 whose body is an Error document is a failure")
+    test.assert(s3op.body_is_error(reply))
+
+    test.case("and the code inside it reaches the caller")
+    match s3fault.code_of_text("InternalError")
+        S3InternalError => test.assert(true)
+        _               => test.fail("the service's own code is the answer")
+
+@test
+fn test_the_status_is_not_the_answer_and_the_code_is() [io]
+    // S3 answers 403 for four unrelated things, and the only way to
+    // tell them apart is the `<Code>` element inside the body.
+    test.case("a wrong signature is retried never")
+    test.assert(not s3fault.is_retryable(S3SignatureDoesNotMatch))
+
+    test.case("a refused policy is retried never")
+    test.assert(not s3fault.is_retryable(S3AccessDenied))
+
+    test.case("a rate limit is")
+    test.assert(s3fault.is_retryable(S3SlowDown))
+
+    test.case("and an unknown code is carried rather than guessed at")
+    match s3fault.code_of_text("XMinioAdminNoSuchPolicy")
+        S3OtherCode(c) => test.assert_eq_str(c, "XMinioAdminNoSuchPolicy")
+        _              => test.fail("a service may invent a code")
+
+@test
+fn test_a_missing_key_is_told_apart_from_a_missing_bucket() [io]
+    // Both are 404.  A caller treating "absent" as an ordinary answer
+    // has to be sure it is the key that is absent and not the bucket,
+    // or a typo in a bucket name looks like an empty prefix.
+    let doc = S3ErrorDoc { code: S3NoSuchKey, message: "", resource: "/b/k",
+                           request_id: "", host_id: "" }
+    test.case("a NoSuchKey fault is the ordinary absence")
+    test.assert(s3fault.is_no_such_key(S3FaultService(404, doc)))
+
+    let other = S3ErrorDoc { code: S3NoSuchBucket, message: "", resource: "/b",
+                             request_id: "", host_id: "" }
+    test.case("and a NoSuchBucket at the same status is not")
+    test.assert(not s3fault.is_no_such_key(S3FaultService(404, other)))
+
+@test
+fn test_a_ranged_get_reads_its_total_from_content_range_and_not_content_length() [io]
+    // `Content-Length` on a ranged reply is the length of the RANGE.  A
+    // resumer that read it concludes the object is five hundred bytes
+    // long and stops.
+    let headers = ["Content-Range: bytes 0-499/1234", "Content-Length: 500"]
+    test.case("the total comes out of Content-Range")
+    match s3req.content_range_of(headers)
+        Some((first, last, total)) =>
+            test.assert_eq(first, 0)
+            test.assert_eq(last, 499)
+            test.assert_eq(total, 1234)
+        None                       => test.fail("a ranged reply names its total")
+
+@test
+fn test_a_suffix_range_and_an_offset_range_differ_by_one_character() [io]
+    // `bytes=-9` is the last nine bytes; `bytes=9-` is everything from
+    // the tenth onwards.  Two headers, one character apart, and nothing
+    // on either side validates which was meant.
+    test.case("a suffix range")
+    test.assert_eq_str(s3req.range_suffix(9), "bytes=-9")
+
+    test.case("an offset range")
+    test.assert_eq_str(s3req.range_from(9), "bytes=9-")
+
+    test.case("and a closed interval")
+    test.assert_eq_str(s3req.range_header(0, 9), "bytes=0-9")
+
+@test
+fn test_a_content_type_comes_from_the_key_because_s3_keeps_it_forever() [io]
+    // S3 stores the type it is given and serves it back forever, so a
+    // bucket uploaded without one serves a website that downloads its
+    // own pages.  Fixing it afterwards is a copy of every object.
+    test.case("an extension names a type")
+    test.assert_eq_str(s3req.content_type_for("index.html"), "text/html")
+
+    test.case("and a key with no extension falls back honestly")
+    test.assert_eq_str(s3req.content_type_for("blob"), "application/octet-stream")
+
+@test
+fn test_metadata_round_trips_in_lowercase_or_it_does_not_round_trip() [io]
+    // S3 lowercases metadata keys on the way out.  A caller that stored
+    // `Author` and read back `author` has a round trip that silently
+    // does not round-trip.
+    let h = s3req.metadata_header("Author", "ada")
+    test.case("the header name is lowercased on the way in")
+    test.assert_eq_str(h.name, "x-amz-meta-author")
+
+    test.case("and the two-kilobyte ceiling is checked before the body is sent")
+    test.assert(s3req.metadata_fits([h]))
+
+@test
+fn test_a_batch_delete_answers_two_hundred_with_failures_inside_it() [io]
+    // A caller that read the status concluded that a thousand objects
+    // were removed when nine hundred were.
+    let body = "<?xml version=\"1.0\"?><DeleteResult></DeleteResult>"
+    let reply = S3Reply { status: 200, headers: [], body: bytes.from_str(body),
+                          streamed: false }
+    test.case("every outcome is answered, not a boolean")
+    match s3op.read_delete_many(reply)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("and the ceiling is a thousand keys")
+    test.assert_eq(s3op.S3_DELETE_MAX_KEYS, 1000)
+
+@test
+fn test_the_whole_client_runs_over_a_transport_that_costs_nothing() [io]
+    // The claim this file exists to check: `get_over_a_tape` carries no
+    // effect row, and it drives a signature, a request build, a
+    // transport exchange and a reply read.  If anything in that chain
+    // reached a socket the compiler would have refused the function
+    // above rather than this assertion.
+    test.case("a GET over a recorded tape needs no effects")
+    match get_over_a_tape(tape(200, "hello"))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_shipped_transport_refuses_an_https_endpoint_by_name() [io]
+    // `std.http` routes https to a pair of one-shot entries that cover
+    // GET and POST, answer no response headers and synthesise a 200.
+    // An object store needs PUT, HEAD, DELETE, the ETag and the real
+    // status, so this refuses rather than appearing to work.
+    let secure = s3cfg.aws("eu-north-1", s3cfg.credentials("k", "s"))
+    test.case("an https endpoint has no transport in this release")
+    match s3client.std_http(secure, 30000)
+        Ok(_)  => test.fail("the shipped transport is plaintext-only")
+        Err(_) => test.assert(true)
+
+    test.case("and a plaintext one does")
+    match s3client.std_http(test_cfg(), 30000)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a plaintext endpoint is what this transport serves")

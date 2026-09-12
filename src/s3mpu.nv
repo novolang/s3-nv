@@ -1,0 +1,261 @@
+// s3mpu.nv — a multipart upload as a state machine the caller drives.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  The upload holds no socket and no file; it holds
+// part numbers, ETags and a plan.  The caller does the sending, which
+// is what makes a resumable upload across a process restart a matter of
+// storing this value rather than reimplementing the protocol.
+//
+// `S3MpuStep` IS THE LOAD-BEARING TYPE OF THIS MODULE, AND ITS
+// IMPORTANT VARIANT IS `S3MpuMustAbort`.  A multipart upload that is
+// neither completed nor aborted leaves its parts in the bucket
+// FOREVER — they do not appear in a listing, they are not reachable by
+// any key, and they are billed.  Every real S3 deployment has a
+// lifecycle rule to sweep them precisely because every real client
+// leaks them.  So the state machine cannot reach a terminal failure
+// without saying, in the value it hands back, that an abort is owed;
+// `upload_id_of` is public so the caller can store it and abort after a
+// crash; and `abort` sits directly beside `complete` in this file
+// rather than three screens away.
+//
+// THE PART PLAN IS COMPUTED BEFORE ANYTHING IS SENT, and that is the
+// other reason this module exists.  Every part but the last must be at
+// least five mebibytes; a part below the floor is accepted at upload
+// time and refused at COMPLETE, with `EntityTooSmall`, after every byte
+// has been uploaded and paid for.  `plan_parts` answers the sizes up
+// front, `part_size_ok` is the predicate on its own, and a caller that
+// picks its own sizes gets `S3FaultPartTooSmall` before a request is
+// built rather than from the service an hour later.
+
+// The largest number of parts one upload may have.
+pub const S3_MAX_PARTS = 10000
+
+// The largest a single part may be: five gibibytes.
+pub const S3_PART_MAX_BYTES = 5368709120
+
+// The largest object a multipart upload can produce: five tebibytes.
+pub const S3_OBJECT_MAX_BYTES = 5497558138880
+
+// Where an upload is.
+pub enum S3MpuState
+    // Nothing has been initiated.  `initiate` is the only move.
+    S3MpuFresh
+    // An upload id exists and parts may be sent.
+    S3MpuOpen
+    // Every planned part has an ETag; `complete` is the move.
+    S3MpuFull
+    // Completed.  Terminal.
+    S3MpuDone
+    // Aborted.  Terminal, and the only terminal state that leaks
+    // nothing.
+    S3MpuAborted
+
+// What the caller does next.
+pub enum S3MpuStep
+    // Send this request, then hand the reply to `supply_start`.
+    S3MpuSendInitiate(request: S3Request)
+    // Send this request with the bytes of part `number`, then hand the
+    // reply to `supply_part`.
+    S3MpuSendPart(number: Int, offset: Int, length: Int, request: S3Request)
+    // Send this request, then hand the reply to `supply_complete`.
+    S3MpuSendComplete(request: S3Request)
+    // Finished.
+    S3MpuFinished(result: S3UploadDone)
+    // Something failed AND THERE ARE PARTS IN THE BUCKET.  The request
+    // is the abort; sending it is not optional, and a caller that drops
+    // this value on the floor has leaked storage that nothing will
+    // report.
+    S3MpuMustAbort(fault: S3Fault, request: S3Request)
+    // Something failed before any part was stored, so there is nothing
+    // to clean up.
+    S3MpuFailed(fault: S3Fault)
+
+// One planned part.
+pub struct S3MpuPart
+    // One-based.  S3 numbers parts from 1.
+    number: Int
+    offset: Int
+    length: Int
+    // Empty until the part has been uploaded.
+    etag: Str
+
+// A multipart upload in progress.
+pub struct S3Mpu
+    bucket: Str
+    key: Str
+    // Empty until `initiate` has been answered.
+    upload_id: Str
+    state: S3MpuState
+    total: Int
+    parts: [S3MpuPart]
+    // How many parts carry an ETag.
+    uploaded: Int
+
+// Whether a size is legal for a part that is not the last.
+//
+// ```novo
+// use s3mpu
+//
+// fn ok(n: Int) -> Bool
+//     s3mpu.part_size_ok(n)
+// ```
+pub fn part_size_ok(size: Int) -> Bool []
+    todo("s3-nv.s3mpu.part_size_ok")
+
+// The part sizes for an object of `total` bytes at a preferred size.
+//
+// Answers the plan, or the fault that says the plan is impossible:
+// below the floor, above the ceiling, or more than ten thousand parts.
+// The last part is whatever is left and may be any size at all,
+// including one byte.
+//
+// THE PREFERRED SIZE IS RAISED RATHER THAN THE PART COUNT EXCEEDED.  An
+// eight-hundred-gibibyte object at an eight-mebibyte part size is a
+// hundred thousand parts, which is ten times the limit; answering a
+// fault there would be correct and useless, so the plan raises the part
+// size to the smallest one that fits and the caller can see what it
+// became.
+//
+// ```novo
+// use s3fault
+// use s3mpu
+//
+// fn plan(n: Int) -> Result<[S3MpuPart], S3Fault>
+//     s3mpu.plan_parts(n, 8388608)
+// ```
+pub fn plan_parts(total: Int, preferred: Int) -> Result<[S3MpuPart], S3Fault> []
+    todo("s3-nv.s3mpu.plan_parts")
+
+// The part size `plan_parts` would use.
+pub fn planned_part_size(total: Int, preferred: Int) -> Result<Int, S3Fault> []
+    todo("s3-nv.s3mpu.planned_part_size")
+
+// Whether an object of this size needs a multipart upload at all.
+//
+// Below five gibibytes a single PUT is one round trip and no cleanup
+// liability, and a client that used multipart for everything pays both
+// for a file of four kilobytes.
+pub fn needs_multipart(total: Int) -> Bool []
+    todo("s3-nv.s3mpu.needs_multipart")
+
+// A fresh upload for an object of `total` bytes.
+pub fn upload(bucket: Str, key: Str, total: Int, preferred_part: Int) -> Result<S3Mpu, S3Fault> []
+    todo("s3-nv.s3mpu.upload")
+
+// An upload resumed from an id and the parts a `ListParts` reported.
+//
+// The case that makes the whole design worth having: a process that
+// died after eight hundred parts can pick the upload up from its id
+// rather than sending eight hundred parts again.
+pub fn resume(bucket: Str, key: Str, upload_id: Str, total: Int, preferred_part: Int,
+              known: [S3PartInfo]) -> Result<S3Mpu, S3Fault> []
+    todo("s3-nv.s3mpu.resume")
+
+// What to do next.
+//
+// The pump.  Called after every `supply_*`, and the value it answers is
+// the whole of the caller's instruction.
+//
+// ```novo
+// use s3mpu
+//
+// fn next(u: S3Mpu) -> S3MpuStep
+//     s3mpu.step(u)
+// ```
+pub fn step(u: S3Mpu) -> S3MpuStep []
+    todo("s3-nv.s3mpu.step")
+
+// Hand back the reply to `S3MpuSendInitiate`.
+pub fn supply_start(u: S3Mpu, r: S3Reply) -> Result<S3Mpu, S3Fault> []
+    todo("s3-nv.s3mpu.supply_start")
+
+// Hand back the reply to `S3MpuSendPart`.
+//
+// The ETag is read out of the reply and stored; a part whose reply
+// carried no ETag is a part the service did not keep, however friendly
+// its status was.
+pub fn supply_part(u: S3Mpu, number: Int, r: S3Reply) -> Result<S3Mpu, S3Fault> []
+    todo("s3-nv.s3mpu.supply_part")
+
+// Hand back the reply to `S3MpuSendComplete`.
+//
+// Checks the body and not only the status: a completion answers 200
+// and then streams whitespace while it works, and the failure arrives
+// inside that body.
+pub fn supply_complete(u: S3Mpu, r: S3Reply) -> Result<S3UploadDone, S3Fault> []
+    todo("s3-nv.s3mpu.supply_complete")
+
+// Record an out-of-band failure and move to the state that owes an
+// abort.
+//
+// What a caller calls when its own side failed — the file could not be
+// read, the process is shutting down — so that `step` answers
+// `S3MpuMustAbort` rather than the caller having to know that it should
+// abort.
+pub fn fail(u: S3Mpu, f: S3Fault) -> S3Mpu []
+    todo("s3-nv.s3mpu.fail")
+
+// The abort request for an upload, whatever state it is in.
+//
+// Also the call a caller makes with nothing but an upload id, after a
+// crash, with no `S3Mpu` at all — which is why `abort_request` takes
+// the three strings rather than the value.
+pub fn abort(u: S3Mpu) -> Result<S3Request, S3Fault> []
+    todo("s3-nv.s3mpu.abort")
+
+// The abort request from an upload id alone.
+//
+// ```novo
+// use s3mpu
+//
+// fn cleanup(b: Str, k: Str, id: Str) -> S3Request
+//     s3mpu.abort_request(b, k, id)
+// ```
+pub fn abort_request(bucket: Str, key: Str, upload_id: Str) -> S3Request []
+    todo("s3-nv.s3mpu.abort_request")
+
+// A request that lists the parts already uploaded, for a resume.
+pub fn list_parts_request(bucket: Str, key: Str, upload_id: Str, after: Int) -> S3Request []
+    todo("s3-nv.s3mpu.list_parts_request")
+
+// A request that lists the unfinished uploads in a bucket.
+//
+// The operation an operator runs to find what every client has leaked,
+// and the reason a library should publish it rather than leave it to
+// the console.
+pub fn list_uploads_request(bucket: Str, prefix: Str) -> S3Request []
+    todo("s3-nv.s3mpu.list_uploads_request")
+
+// The upload id, for a caller storing it across a restart.
+pub fn upload_id_of(u: S3Mpu) -> Str []
+    todo("s3-nv.s3mpu.upload_id_of")
+
+// Where the upload is.
+pub fn state_of(u: S3Mpu) -> S3MpuState []
+    todo("s3-nv.s3mpu.state_of")
+
+// The plan, for a caller reading its own file.
+pub fn parts_of(u: S3Mpu) -> [S3MpuPart] []
+    todo("s3-nv.s3mpu.parts_of")
+
+// How many parts have been uploaded, and how many there are.
+pub fn progress_of(u: S3Mpu) -> (Int, Int) []
+    todo("s3-nv.s3mpu.progress_of")
+
+// Whether this upload has parts stored in the bucket.
+//
+// The question a caller answers before deciding whether a failure needs
+// cleaning up.  True from the moment `initiate` succeeded, because a
+// zero-part upload is still an upload id that has to be aborted.
+pub fn owes_abort(u: S3Mpu) -> Bool []
+    todo("s3-nv.s3mpu.owes_abort")
+
+// The completion document's part list, sorted ascending.
+//
+// S3 refuses a completion whose parts are out of order with
+// `InvalidPartOrder`, and the order a caller uploaded them in is not
+// necessarily ascending — a parallel uploader finishes them in
+// whatever order the network decided.
+pub fn completion(u: S3Mpu) -> Result<[S3PartInfo], S3Fault> []
+    todo("s3-nv.s3mpu.completion")

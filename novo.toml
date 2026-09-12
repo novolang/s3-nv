@@ -1,0 +1,77 @@
+[package]
+name        = "s3-nv"
+version     = "0.0.1"
+description = "An S3-compatible object store client: SigV4 signing and presigned URLs as pure arithmetic, put/get/head/delete/copy, ListObjectsV2 with pagination, a multipart upload the caller drives, the XML replies over xml-nv, and an endpoint value that makes AWS, MinIO and Cloudflare R2 the same three fields.  The transport is a trait, so a test drives a whole exchange with no socket.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and SEVEN OF THE EIGHT MODULES DECLARE NOTHING.  `s3fault`,
+# `s3cfg`, `s3sig`, `s3req`, `s3op`, `s3xml` and `s3mpu` are `[]`
+# throughout: SigV4 is HMAC over strings the caller already holds, an
+# operation is a request value, a reply is a parse, and the multipart
+# upload is a state machine the caller pumps.  What performs is
+# `s3client` — `[io, net, time, async]`, which is `std.http`'s
+# `HttpClient.send` row and not a choice this package made.
+#
+# `layer = "host"` AND NOT `layer = "core"` WITH `host_modules`,
+# because the subject of the package is a request that reaches a
+# bucket.  The README argues the `s3-core-nv` row the seven `[]`
+# modules would move to and recommends NOT taking it yet, with the
+# reason.
+layer       = "host"
+
+category    = "networking"
+
+tags        = ["s3", "object-storage", "sigv4", "aws", "minio", "r2", "multipart", "presigned"]
+repository  = "https://github.com/novolang/s3-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Objects in a bucket, and the signature under them"
+
+[dependencies]
+# SHA-256 and HMAC-SHA256, which the whole of SigV4 is built from:
+# `sha256` for the payload hash and the canonical-request hash,
+# `hmac_sha256` four times for the signing key, and `ct_eq` for
+# comparing a signature a caller received against one this package
+# computed.
+crypto-nv = "^0.1"
+
+# The XML every S3 reply that is not a bare object body is written in:
+# ListBucketResult, the `<Error>` document a 4xx carries,
+# InitiateMultipartUploadResult, CompleteMultipartUploadResult and
+# DeleteResult.  `s3xml` is a reader over this package's tree and
+# parses no XML of its own.
+xml-nv = "^0.0.1"
+
+# Percent-encoding, and the reason it is a dependency rather than four
+# lines here: SigV4's canonical URI and its canonical query string use
+# two DIFFERENT encodings of the same path, and `PctSet` is the type
+# that makes the difference something a reader can see rather than a
+# second escape table nobody compares.
+url-nv = "^0.1"
+
+# Content types from a key's extension, for the `Content-Type` a `put`
+# sends when the caller did not name one.  S3 stores whatever it is
+# given and serves it back, so a library that defaulted to
+# `application/octet-stream` puts a website behind a bucket that
+# downloads its own pages instead of rendering them.
+mime-nv = "^0.0.1"
+
+# Civil dates and times, for the two timestamp formats SigV4 needs —
+# the ISO8601 basic form in `x-amz-date` and the `yyyymmdd` in the
+# credential scope — and for the `Last-Modified` and `Expires` a reply
+# carries.  A `core` module has no clock: every function here takes the
+# instant, and `s3client.now_civil` is the one function in the package
+# that reads one.
+calendar-nv = "^0.0.2"

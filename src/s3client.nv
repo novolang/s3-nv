@@ -1,0 +1,247 @@
+// s3client.nv — the half that touches the machine.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS IS THE ONLY MODULE IN THE PACKAGE WITH AN EFFECT ROW.  Seven
+// modules under `src/` are `[]` throughout; everything that performs
+// anything is here.
+//
+// `S3Transport[e]` IS THE TRAIT THAT CROSSES THE LAYER.  Every call in
+// this module that sends something is generic over it and declares
+// `[e]`, so a call costs exactly what the caller's transport costs —
+// and `tests/s3flow_tests.nv` drives a whole exchange over a recorded
+// tape at `[]`, with no socket, no clock and the same bytes every run.
+//
+// WHY THE SHIPPED TRANSPORT IS `[io, net, time, async]`.  That is
+// `std.http`'s `HttpClient.send` row, exactly, and not a choice this
+// package made: the standard library's HTTP client puts its deadline
+// behind a clock, its socket behind the async runtime, and the socket
+// layer itself declares `[io]`.  A caller that does not want those four
+// labels in its program supplies its own transport, which is the whole
+// reason the trait is here — llm-client-nv made the same argument and
+// shipped two transports for it.
+//
+// AND WHY THE SHIPPED TRANSPORT IS PLAINTEXT-ONLY, WHICH IS THE
+// HONEST LIMIT OF THIS RELEASE.  `std.http` routes `https` to a pair
+// of one-shot entries that cover GET and POST, answer no response
+// headers and synthesise a status of 200.  An object store needs PUT,
+// HEAD and DELETE; it needs the ETag, `Content-Range` and
+// `x-amz-request-id` out of the headers; and it needs to tell a 404
+// from a 403 from a 412.  None of that survives that path, so
+// `std_http` REFUSES an `https` endpoint by name rather than appearing
+// to work against one.  What it does serve is every deployment whose
+// endpoint is plaintext, which is MinIO in a test rig, a gateway inside
+// a VPC, and the whole of this package's own test story.  The row that
+// closes it is tls-nv's: a `TlsStream` that implements `Read`/`Write`
+// makes `std.http`'s own seam collapse, and until then an `S3TlsHttp`
+// over tls-nv is the transport to write.  The README says so under
+// "What is missing".
+
+use s3mpu
+use s3sig
+
+// A transport one S3 exchange can be driven over.
+//
+// `e` is the row the implementation supplies, and it is what every
+// sending function in this module costs: `[io, net, time, async]` over
+// the standard library's HTTP client, and nothing at all over a
+// recorded exchange in a test.
+pub trait S3Transport[e]
+    // Send one request and buffer the whole reply.
+    fn s3_exchange(self, origin: Str, method: Str, target: Str, headers: [S3Header], body: Bytes) -> Result<S3Reply, S3Fault> [e]
+    // Send one request and stop after the head, leaving the body on
+    // the wire for `s3_read`.  What a download of an object larger than
+    // memory needs, and the reason the trait has four methods.
+    fn s3_open(self, origin: Str, method: Str, target: Str, headers: [S3Header], body: Bytes) -> Result<S3Reply, S3Fault> [e]
+    // Up to `max` bytes of a body left on the wire.  An EMPTY answer
+    // means the peer closed, which before `Content-Length` bytes have
+    // arrived is `S3FaultTruncatedBody` and not an end.
+    fn s3_read(self, max: Int) -> Result<Bytes, S3Fault> [e]
+    // Close it.
+    fn s3_close(self) -> ?S3Fault [e]
+
+// A transport over the standard library's HTTP client.
+//
+// Plaintext endpoints only; see the module comment.
+pub struct S3StdHttp
+    client: HttpClient
+    timeout_ms: Int
+
+// A client: a configuration and nothing else.
+//
+// No connection, no cached signing key and no clock.  Every call takes
+// the transport and the instant, which is what keeps this type copyable
+// and what lets one configuration serve many concurrent transports.
+pub struct S3Client
+    cfg: S3Config
+
+// A client for a configuration.
+//
+// ```novo
+// use s3cfg
+// use s3client
+//
+// fn c(cfg: S3Config) -> S3Client
+//     s3client.client(cfg)
+// ```
+pub fn client(cfg: S3Config) -> S3Client []
+    todo("s3-nv.s3client.client")
+
+// A standard-library transport for an endpoint.
+//
+// Building one performs nothing; the four labels are spent in
+// `s3_exchange`.  An `https` endpoint is `S3FaultNoTlsTransport` here
+// rather than a failure at the first request.
+//
+// ```novo
+// use s3cfg
+// use s3client
+// use s3fault
+//
+// fn t(cfg: S3Config) -> Result<S3StdHttp, S3Fault>
+//     s3client.std_http(cfg, 30000)
+// ```
+pub fn std_http(cfg: S3Config, timeout_ms: Int) -> Result<S3StdHttp, S3Fault> []
+    todo("s3-nv.s3client.std_http")
+
+// Sign a request and send it.
+//
+// The one call every operation goes through: the payload hash comes
+// from the body, `s3sig.payload_allowed` refuses the combination that
+// is not safe, the signature's headers are added, and the transport
+// sends it.  Effect-polymorphic over the transport, so it costs what
+// the transport costs.
+pub fn send<T: S3Transport[e]>(c: S3Client, t: T, r: S3Request,
+                               at: CivilDateTime) -> Result<S3Reply, S3Fault> [e]
+    todo("s3-nv.s3client.send")
+
+// Sign a request and send it, leaving the body on the wire.
+pub fn open<T: S3Transport[e]>(c: S3Client, t: T, r: S3Request,
+                               at: CivilDateTime) -> Result<S3Reply, S3Fault> [e]
+    todo("s3-nv.s3client.open")
+
+// GET an object into memory.
+pub fn get_object<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str,
+                                     at: CivilDateTime) -> Result<S3Object, S3Fault> [e]
+    todo("s3-nv.s3client.get_object")
+
+// GET a byte range of an object.
+pub fn get_range<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str, first: Int, last: Int,
+                                    at: CivilDateTime) -> Result<S3Object, S3Fault> [e]
+    todo("s3-nv.s3client.get_range")
+
+// HEAD an object.
+pub fn head_object<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str,
+                                      at: CivilDateTime) -> Result<S3Head, S3Fault> [e]
+    todo("s3-nv.s3client.head_object")
+
+// PUT bytes.
+pub fn put_object<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str, data: Bytes,
+                                     at: CivilDateTime) -> Result<S3Put, S3Fault> [e]
+    todo("s3-nv.s3client.put_object")
+
+// DELETE an object.
+pub fn delete_object<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str,
+                                        at: CivilDateTime) -> ?S3Fault [e]
+    todo("s3-nv.s3client.delete_object")
+
+// COPY an object, server-side.
+pub fn copy_object<T: S3Transport[e]>(c: S3Client, t: T, src_bucket: Str, src_key: Str,
+                                      dst_bucket: Str, dst_key: Str,
+                                      at: CivilDateTime) -> Result<Str, S3Fault> [e]
+    todo("s3-nv.s3client.copy_object")
+
+// One page of a listing.
+//
+// ONE PAGE, DELIBERATELY.  There is no `list_all`: a bucket with four
+// million objects is four thousand round trips, and a function that
+// hid them behind a single call would be a function that cannot be
+// stopped, checkpointed or rate-limited, and that returns an array
+// nobody sized.  The loop is five lines in the caller and it is the
+// caller's.
+pub fn list_page<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, prefix: Str, delimiter: Str,
+                                    max_keys: Int, after: ?Str,
+                                    at: CivilDateTime) -> Result<S3ListPage, S3Fault> [e]
+    todo("s3-nv.s3client.list_page")
+
+// Drive one step of a multipart upload.
+//
+// The caller supplies the bytes of the part the step names; this signs
+// and sends whatever `s3mpu.step` asked for and hands the reply back to
+// the state machine.  `S3MpuMustAbort` is answered, not acted on: an
+// abort that a library sent on the caller's behalf is an abort the
+// caller could not decide to skip.
+pub fn pump<T: S3Transport[e]>(c: S3Client, t: T, u: S3Mpu, part: Bytes,
+                               at: CivilDateTime) -> Result<S3Mpu, S3Fault> [e]
+    todo("s3-nv.s3client.pump")
+
+// Send an abort for an upload id.
+//
+// Separate from `pump` and taking the three strings rather than an
+// `S3Mpu`, because the caller that most needs it is the one that has
+// just restarted and holds nothing but the id it wrote down.
+pub fn abort_upload<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str, upload_id: Str,
+                                       at: CivilDateTime) -> ?S3Fault [e]
+    todo("s3-nv.s3client.abort_upload")
+
+// Drain a body left on the wire into a caller's buffer.
+//
+// Answers how many bytes were written.  The buffer is the caller's, so
+// a download of a four-gibibyte object is a loop over a fixed buffer
+// rather than an allocation the size of the object.
+pub fn drain_into<T: S3Transport[e]>(t: T, into: Bytes, want: Int) -> Result<Int, S3Fault> [e]
+    todo("s3-nv.s3client.drain_into")
+
+// The wall clock as a civil date and time, UTC.
+//
+// THE ONE FUNCTION IN THIS PACKAGE THAT READS A CLOCK, and the reason
+// `[time]` is in the package's row at all.  Every signing function
+// takes the instant it answers, so a test signs against AWS's published
+// vectors and gets their published signatures.
+pub fn now_civil() -> CivilDateTime [time]
+    todo("s3-nv.s3client.now_civil")
+
+// Credentials from the environment.
+//
+// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and the optional
+// `AWS_SESSION_TOKEN`.  `[io]`, which is what reading the environment
+// costs, and OPT-IN: a library that read these for its caller decided
+// for every program that links it that an environment variable is a
+// credential source.  A server with an instance metadata endpoint and a
+// CLI with a profile file both want something else.
+//
+// `None` when the two required variables are not both set, rather than
+// empty credentials — empty credentials produce a signature, and a
+// signature from no secret fails with `SignatureDoesNotMatch`, which
+// sends the caller looking in the wrong place.
+pub fn credentials_from_env() -> ?S3Credentials [io]
+    todo("s3-nv.s3client.credentials_from_env")
+
+// The standard library's HTTP client as a transport.
+//
+// `[io, net, time, async]` on every method, which is `HttpClient`'s own
+// row.  Plaintext endpoints only.
+//
+// ```novo
+// use std.bytes
+// use s3client
+// use s3fault
+// use s3req
+//
+// fn one(t: S3StdHttp, o: Str) -> Result<S3Reply, S3Fault> [io, net, time, async]
+//     t.s3_exchange(o, "GET", "/b/k", [], bytes.zeros(0))
+// ```
+impl S3Transport[io, net, time, async] for S3StdHttp
+    fn s3_exchange(self, origin: Str, method: Str, target: Str, headers: [S3Header],
+                   body: Bytes) -> Result<S3Reply, S3Fault> [io, net, time, async]
+        todo("s3-nv.s3client.S3StdHttp.s3_exchange")
+
+    fn s3_open(self, origin: Str, method: Str, target: Str, headers: [S3Header],
+               body: Bytes) -> Result<S3Reply, S3Fault> [io, net, time, async]
+        todo("s3-nv.s3client.S3StdHttp.s3_open")
+
+    fn s3_read(self, max: Int) -> Result<Bytes, S3Fault> [io, net, time, async]
+        todo("s3-nv.s3client.S3StdHttp.s3_read")
+
+    fn s3_close(self) -> ?S3Fault [io, net, time, async]
+        todo("s3-nv.s3client.S3StdHttp.s3_close")

@@ -1,0 +1,352 @@
+// s3sig.nv — Signature Version 4, as arithmetic.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT, INSTANT INCLUDED.  Every function takes the moment
+// it signs for as a `CivilDateTime` argument.  That is not a purity
+// exercise: AWS publishes worked examples of SigV4 with a fixed
+// timestamp and the exact canonical request, string to sign and
+// signature each step produces, and a signer that read its own clock
+// could not be run against them.  `s3client.now_civil` is the single
+// function in this package that reads a clock.
+//
+// THE PAYLOAD HASH IS THE LOAD-BEARING VALUE — `S3PayloadHash`, three
+// cases, and the whole design of the request layer follows from it.
+// SigV4 signs the SHA-256 of the body, which means the body has to be
+// known before the first byte is sent.  Three answers exist and they
+// are not interchangeable:
+//
+//   `S3PayloadSha256` — the hash.  Integrity end to end, and it costs
+//   a pass over the object before the upload starts.
+//
+//   `S3PayloadUnsigned` — the literal `UNSIGNED-PAYLOAD`.  The body is
+//   not covered by the signature at all.  Over TLS that is a trade; over
+//   `http://` it means anything on the path can replace the object and
+//   the signature still verifies, so `payload_allowed` REFUSES it there.
+//
+//   `S3PayloadStreaming` — the chunked form, where each chunk carries
+//   its own signature chained to the last.  Integrity without a
+//   pre-pass, at the cost of a framing the caller's transport has to
+//   write.
+//
+// A library that took `Bytes` would have chosen the first for
+// everybody, and an object store whose uploads have to fit in memory
+// is not an object store.  A library that defaulted to the second
+// would have removed integrity from every upload without ever saying
+// so.  So the caller names one, and the three faults it can produce
+// are all named too.
+//
+// TWO ENCODINGS OF ONE PATH, AND THE REASON THEY ARE TWO FUNCTIONS.
+// The canonical URI encodes every character outside the unreserved set
+// EXCEPT `/`; the canonical query string encodes `/` as well.  A
+// signer that used one table for both computes a signature that is
+// right for keys without slashes and wrong for the rest — which is a
+// bug that passes every test written against `hello.txt` and fails on
+// the first object in a folder.
+
+use s3cfg
+
+// The algorithm string, in the `Authorization` header and in the
+// string to sign.
+pub const S3_SIGV4_ALGORITHM = "AWS4-HMAC-SHA256"
+
+// The literal a request uses to say its body is not signed.
+pub const S3_UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
+
+// The literal a chunked, per-chunk-signed body uses.
+pub const S3_STREAMING_PAYLOAD = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+
+// The SHA-256 of the empty string, in lowercase hex.
+//
+// Published as a constant because it is the payload hash of every GET,
+// HEAD and DELETE this package sends, and recomputing it per request
+// is a hash over nothing in a signer's hot path.
+pub const S3_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// The longest lifetime a presigned URL may carry, in seconds: seven
+// days.  A URL signed for longer is accepted by this package's signer
+// and refused by the service, so it is refused here instead.
+pub const S3_PRESIGN_MAX_SECONDS = 604800
+
+// How far a request's `x-amz-date` may be from the service's clock
+// before it is refused: fifteen minutes.
+pub const S3_CLOCK_SKEW_SECONDS = 900
+
+// The one thing SigV4 needs from a body before it is sent.
+//
+// See the module comment: the three cases are three different trades
+// and this package makes the caller name one.
+pub enum S3PayloadHash
+    // The body's SHA-256, lowercase hex.
+    S3PayloadSha256(hex: Str)
+    // `UNSIGNED-PAYLOAD`.  Refused over a plaintext endpoint.
+    S3PayloadUnsigned
+    // `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, with the total length of
+    // the decoded content — which the request must also declare in
+    // `x-amz-decoded-content-length`, because `Content-Length` then
+    // describes the framed bytes and not the object.
+    S3PayloadStreaming(decoded_length: Int)
+
+// A canonical request, with its six parts kept apart.
+//
+// Six fields rather than one string, because when a signature does not
+// match, the question is always WHICH part differs — and a service that
+// answers `SignatureDoesNotMatch` echoes its own canonical request in
+// the error document for exactly that comparison.  A caller holding
+// this value can diff it field by field.
+pub struct S3CanonicalRequest
+    method: Str
+    // The path, encoded.  `/` survives; everything else outside the
+    // unreserved set is percent-encoded once.
+    uri: Str
+    // The query, encoded and sorted by name and then by value.
+    query: Str
+    // `name:value` lines, lowercased names, sorted, with a trailing
+    // newline.
+    headers: Str
+    // The lowercased header names, sorted, joined with `;`.
+    signed_headers: Str
+    // The payload hash as it appears in `x-amz-content-sha256`.
+    payload: Str
+
+// The four strings of a credential scope, kept apart for the same
+// reason the canonical request's six are.
+pub struct S3Scope
+    // `yyyymmdd`, UTC.
+    day: Str
+    region: Str
+    service: Str
+    // The literal `aws4_request`.
+    terminator: Str
+
+// A finished signature and the header that carries it.
+pub struct S3Signature
+    // The signature, lowercase hex.
+    hex: Str
+    // The full `Authorization` header value.
+    header: Str
+    // The `x-amz-date` the signature covers.  A caller that sent a
+    // different one sends a request that cannot verify, so the signer
+    // hands back the exact string rather than expecting the caller to
+    // re-derive it.
+    amz_date: Str
+    // The `x-amz-content-sha256` the signature covers.
+    payload: Str
+
+// The `yyyymmddThhmmssZ` form `x-amz-date` carries.
+//
+// The BASIC ISO 8601 form — no dashes, no colons — which is the one
+// place SigV4 differs from every other timestamp in this package.  An
+// extended-form timestamp produces a signature the service computes
+// differently and a 403 with no clue in it.
+//
+// ```novo
+// use s3sig
+//
+// fn stamp(at: CivilDateTime) -> Str
+//     s3sig.amz_date(at)
+// ```
+pub fn amz_date(at: CivilDateTime) -> Str []
+    todo("s3-nv.s3sig.amz_date")
+
+// The `yyyymmdd` form the credential scope carries.
+pub fn amz_day(at: CivilDateTime) -> Str []
+    todo("s3-nv.s3sig.amz_day")
+
+// The credential scope for an instant.
+pub fn scope(at: CivilDateTime, region: Str, service: Str) -> S3Scope []
+    todo("s3-nv.s3sig.scope")
+
+// A scope as the slash-joined string the `Credential` parameter
+// carries.
+pub fn scope_text(s: S3Scope) -> Str []
+    todo("s3-nv.s3sig.scope_text")
+
+// The payload hash a body implies, when it implies one.
+//
+// `S3BodyBytes` answers its own SHA-256; `S3BodyStreamed` answers the
+// hash the caller already computed; `S3BodyNone` answers the empty
+// hash.  `S3BodyStreamedUnhashed` answers `S3PayloadUnsigned`, which is
+// the honest translation and the one `payload_allowed` may refuse.
+pub fn payload_of_body(b: S3Body) -> S3PayloadHash []
+    todo("s3-nv.s3sig.payload_of_body")
+
+// The string `x-amz-content-sha256` carries for a payload hash.
+pub fn payload_text(p: S3PayloadHash) -> Str []
+    todo("s3-nv.s3sig.payload_text")
+
+// Whether this payload hash may be used against this endpoint.
+//
+// `S3PayloadUnsigned` over `http://` is `S3FaultUnsignedOverPlaintext`
+// and nothing else is refused.  A refusal rather than a warning,
+// because the combination has no honest use: the signature then covers
+// the headers and not the body, and the connection protects neither.
+//
+// ```novo
+// use s3cfg
+// use s3sig
+//
+// fn ok(c: S3Config, p: S3PayloadHash) -> Bool
+//     match s3sig.payload_allowed(p, c)
+//         Some(_) => false
+//         None    => true
+// ```
+pub fn payload_allowed(p: S3PayloadHash, cfg: S3Config) -> ?S3Fault []
+    todo("s3-nv.s3sig.payload_allowed")
+
+// The canonical URI for a path.
+//
+// Every byte outside `A-Za-z0-9-._~` is percent-encoded with uppercase
+// hex digits, `/` excepted.  Encoded ONCE for S3, which is the
+// exception the specification writes out: every other AWS service
+// encodes the path twice.
+pub fn canonical_uri(path: Str) -> Str []
+    todo("s3-nv.s3sig.canonical_uri")
+
+// The canonical query string.
+//
+// Sorted by encoded name and then by encoded value, joined with `&`,
+// every pair written `name=value` even when the value is empty — which
+// is why `?acl` signs as `acl=` and a signer that omitted the `=`
+// produces a signature that is wrong for exactly the subresource
+// requests and right for everything else.
+pub fn canonical_query(pairs: [S3QueryPair]) -> Str []
+    todo("s3-nv.s3sig.canonical_query")
+
+// The canonical headers block.
+//
+// Names lowercased, values trimmed and their internal whitespace runs
+// collapsed to one space, sorted by name, one `name:value` line each,
+// with a trailing newline.  Two headers of the same name are joined
+// with a comma in the order they were given.
+pub fn canonical_headers(headers: [S3Header]) -> Str []
+    todo("s3-nv.s3sig.canonical_headers")
+
+// The `SignedHeaders` list for a header set.
+pub fn signed_headers(headers: [S3Header]) -> Str []
+    todo("s3-nv.s3sig.signed_headers")
+
+// The complete canonical request for a request value.
+//
+// This is where `s3cfg`'s addressing style becomes a string: the path
+// comes from `s3cfg.canonical_path`, and the `Host` header the
+// signature covers comes from `s3cfg.host_header`.
+pub fn canonical_request(cfg: S3Config, r: S3Request, p: S3PayloadHash,
+                         at: CivilDateTime) -> Result<S3CanonicalRequest, S3Fault> []
+    todo("s3-nv.s3sig.canonical_request")
+
+// A canonical request as the six-part string that gets hashed.
+pub fn canonical_text(cr: S3CanonicalRequest) -> Str []
+    todo("s3-nv.s3sig.canonical_text")
+
+// The string to sign.
+//
+// Four lines: the algorithm, the `x-amz-date`, the scope, and the
+// lowercase hex SHA-256 of the canonical request.
+pub fn string_to_sign(cr: S3CanonicalRequest, at: CivilDateTime, s: S3Scope) -> Str []
+    todo("s3-nv.s3sig.string_to_sign")
+
+// The signing key: four chained HMAC-SHA256s.
+//
+// `HMAC(HMAC(HMAC(HMAC("AWS4" + secret, day), region), service),
+// "aws4_request")`.  The key depends on the DAY and not the instant,
+// which is what makes it worth caching for a client that signs many
+// requests — and what makes a cached key a bug at midnight UTC, which
+// `key_day_of` exists to let a cache check.
+//
+// The digest is written into `out`, which the caller sizes at 32
+// bytes.  A `core`-shaped function that allocated its own answer would
+// be a function a device could not call.
+pub fn signing_key(secret: Str, s: S3Scope, out: Bytes) -> Result<Bytes, S3Fault> []
+    todo("s3-nv.s3sig.signing_key")
+
+// The day a signing key belongs to, for a cache to compare against.
+pub fn key_day_of(s: S3Scope) -> Str []
+    todo("s3-nv.s3sig.key_day_of")
+
+// The signature: HMAC of the string to sign under the signing key,
+// lowercase hex.
+pub fn sign(key: Bytes, sts: Str) -> Str []
+    todo("s3-nv.s3sig.sign")
+
+// The whole of it: a request, an instant, and the header that
+// authorises it.
+//
+// The one call an ordinary caller makes.  The pieces above are public
+// because when this answers a signature the service disagrees with,
+// the only way forward is to compare the canonical request the service
+// echoed with the one this computed — and that is not a debugging
+// session anybody should have to reimplement.
+//
+// ```novo
+// use s3cfg
+// use s3req
+// use s3sig
+//
+// fn auth(c: S3Config, r: S3Request, at: CivilDateTime) -> Result<S3Signature, S3Fault>
+//     s3sig.authorize(c, r, s3sig.payload_of_body(r.body), at)
+// ```
+pub fn authorize(cfg: S3Config, r: S3Request, p: S3PayloadHash,
+                 at: CivilDateTime) -> Result<S3Signature, S3Fault> []
+    todo("s3-nv.s3sig.authorize")
+
+// The headers a signature adds to a request, in send order.
+//
+// `Host`, `x-amz-date`, `x-amz-content-sha256`, `x-amz-security-token`
+// when the credentials carry one, and `Authorization`.  Published
+// because a caller driving its own transport has to add exactly these
+// and no others: an extra header the signature did not cover is fine,
+// and a MISSING one that `SignedHeaders` names is a 403.
+pub fn authorization_headers(cfg: S3Config, sig: S3Signature) -> [S3Header] []
+    todo("s3-nv.s3sig.authorization_headers")
+
+// A presigned URL, valid for `seconds`.
+//
+// The signature moves from a header into the query string, which is
+// what makes the URL something a caller can hand to a browser or a
+// `curl` that knows no credentials.
+//
+// THE PAYLOAD IS ALWAYS `UNSIGNED-PAYLOAD` AND THERE IS NO PARAMETER
+// FOR IT.  A presigned URL is signed before its body exists — the
+// whole point is that somebody else supplies one — so committing to a
+// body hash would produce a URL that only the person who already had
+// the bytes could use.  The consequence is worth saying out loud: a
+// presigned PUT authorises the upload of ANY body to that key until it
+// expires, so the lifetime is the whole of the control and this
+// function refuses one past seven days.
+//
+// ```novo
+// use s3cfg
+// use s3req
+// use s3sig
+//
+// fn share(c: S3Config, r: S3Request, at: CivilDateTime) -> Result<Str, S3Fault>
+//     s3sig.presign(c, r, 900, at)
+// ```
+pub fn presign(cfg: S3Config, r: S3Request, seconds: Int,
+               at: CivilDateTime) -> Result<Str, S3Fault> []
+    todo("s3-nv.s3sig.presign")
+
+// When a presigned URL stops working.
+//
+// Answers the instant, so a caller can put it in a UI rather than
+// making its user discover the expiry by clicking.
+pub fn presign_expiry(at: CivilDateTime, seconds: Int) -> Result<CivilDateTime, S3Fault> []
+    todo("s3-nv.s3sig.presign_expiry")
+
+// Whether two instants are close enough for a signature to verify.
+//
+// Fifteen minutes.  Published so a client can check its own clock
+// against the `Date` header of a failed reply and say "your clock is
+// wrong" instead of "access denied", which is the difference between a
+// five-second fix and a support ticket.
+pub fn skew_ok(signed_at: CivilDateTime, service_at: CivilDateTime) -> Bool []
+    todo("s3-nv.s3sig.skew_ok")
+
+// The service's clock, out of a reply's `Date` header.
+//
+// The one input `skew_ok` needs that the caller does not already have,
+// and the reason it is here rather than in `s3req`: an RFC 1123 date
+// is the only date format in this package that is not calendar-nv's.
+pub fn service_time_of(headers: [Str]) -> ?CivilDateTime []
+    todo("s3-nv.s3sig.service_time_of")

@@ -1,0 +1,264 @@
+// s3sig_tests.nv — Signature Version 4, against AWS's own published
+// worked example, plus the configuration rules the signature depends
+// on.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: s3-nv.<module>.<fn>`.
+//
+// NOT ONE OF THESE TESTS NEEDS A NETWORK, A CLOCK OR A CREDENTIAL.
+// The instant is an argument everywhere in `s3sig`, which is what
+// makes AWS's published example — a fixed timestamp with the exact
+// canonical request, string to sign and signature each step produces —
+// reproducible here.
+//
+// THE SIGNATURE HEX BELOW IS AWS'S, from the worked example for a GET
+// of `test.txt` from `examplebucket` in `us-east-1` at
+// `20130524T000000Z`.  It is written out so that the first
+// implementation is measured against the reference rather than against
+// itself; whoever turns it green re-confirms it against AWS's own
+// page before trusting a green run.
+
+use std.test
+use std.bytes
+use s3cfg
+use s3fault
+use s3req
+use s3sig
+use civil
+use arith
+use span
+
+// AWS's example access key.  A published test credential and not a
+// secret: it appears in the specification itself.
+fn example_key() -> S3Credentials
+    s3cfg.credentials("AKIAIOSFODNN7EXAMPLE",
+                      "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+// 2013-05-24T00:00:00Z, the instant the worked example signs for.
+fn example_at() -> CivilDateTime
+    match civil.date(2013, 5, 24)
+        Ok(d)  => civil.datetime(d, civil.midnight())
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+
+fn example_cfg() -> S3Config
+    s3cfg.aws("us-east-1", example_key())
+
+@test
+fn test_the_two_timestamp_formats_are_the_two_the_signature_needs() [io]
+    // The basic ISO 8601 form in `x-amz-date` and the `yyyymmdd` in the
+    // scope.  An extended-form timestamp — the one every other part of
+    // this project writes — produces a signature the service computes
+    // differently and a 403 with nothing in it to read.
+    test.case("x-amz-date is the basic form, no dashes and no colons")
+    test.assert_eq_str(s3sig.amz_date(example_at()), "20130524T000000Z")
+
+    test.case("the scope day is eight digits")
+    test.assert_eq_str(s3sig.amz_day(example_at()), "20130524")
+
+@test
+fn test_the_credential_scope_is_four_parts_and_the_last_is_a_constant() [io]
+    let s = s3sig.scope(example_at(), "us-east-1", "s3")
+    test.case("the scope is day/region/service/aws4_request")
+    test.assert_eq_str(s3sig.scope_text(s), "20130524/us-east-1/s3/aws4_request")
+
+    test.case("and the terminator is the literal, not the service again")
+    test.assert_eq_str(s.terminator, "aws4_request")
+
+@test
+fn test_the_empty_payload_hash_is_the_one_every_get_carries() [io]
+    // Published as a constant because it is the payload hash of every
+    // GET, HEAD and DELETE this package sends.
+    test.case("the constant is the SHA-256 of nothing")
+    test.assert_eq_str(s3sig.S3_EMPTY_SHA256,
+                       "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+    test.case("and an empty body hashes to it")
+    match s3sig.payload_of_body(S3BodyNone)
+        S3PayloadSha256(h) => test.assert_eq_str(h, s3sig.S3_EMPTY_SHA256)
+        _                  => test.fail("an absent body has a known hash")
+
+@test
+fn test_the_canonical_uri_encodes_once_and_keeps_the_slash() [io]
+    // S3 is the exception the specification writes out: every other AWS
+    // service encodes the path twice.  And `/` survives, because a key
+    // in a folder is the commonest key there is — a signer that
+    // encoded it produces signatures that are right for `hello.txt`
+    // and wrong for everything under a prefix.
+    test.case("a slash is not encoded")
+    test.assert_eq_str(s3sig.canonical_uri("/a/b/c.txt"), "/a/b/c.txt")
+
+    test.case("a space is, with uppercase hex")
+    test.assert_eq_str(s3sig.canonical_uri("/my file.txt"), "/my%20file.txt")
+
+    test.case("and the unreserved set is left alone")
+    test.assert_eq_str(s3sig.canonical_uri("/a-_.~1"), "/a-_.~1")
+
+@test
+fn test_the_canonical_query_sorts_and_writes_an_equals_even_when_empty() [io]
+    // `?acl` signs as `acl=`.  A signer that omitted the `=` is right
+    // for every ordinary request and wrong for exactly the subresource
+    // ones, which is the hardest kind of wrong to find.
+    test.case("a valueless parameter still carries its equals")
+    test.assert_eq_str(s3sig.canonical_query([S3QueryPair { name: "acl", value: "" }]),
+                       "acl=")
+
+    test.case("and pairs sort by name")
+    let pairs = [S3QueryPair { name: "prefix", value: "b" },
+                 S3QueryPair { name: "delimiter", value: "/" }]
+    test.assert_eq_str(s3sig.canonical_query(pairs), "delimiter=%2F&prefix=b")
+
+@test
+fn test_the_canonical_headers_lowercase_sort_and_trim() [io]
+    let hs = [S3Header { name: "X-Amz-Date", value: "20130524T000000Z" },
+              S3Header { name: "Host", value: "examplebucket.s3.amazonaws.com" },
+              S3Header { name: "Range", value: "  bytes=0-9  " }]
+
+    test.case("the signed header list is lowercased and sorted")
+    test.assert_eq_str(s3sig.signed_headers(hs), "host;range;x-amz-date")
+
+    test.case("and the block trims the value it was given")
+    test.assert_eq_str(s3sig.canonical_headers(hs),
+                       "host:examplebucket.s3.amazonaws.com\nrange:bytes=0-9\nx-amz-date:20130524T000000Z\n")
+
+@test
+fn test_aws_own_worked_example_produces_aws_own_signature() [io]
+    // The reference vector.  GET `/test.txt` from `examplebucket` with
+    // `Range: bytes=0-9`, signed at 20130524T000000Z with the example
+    // credentials.
+    let r = s3req.with_header(s3req.request("GET", "examplebucket", "test.txt"),
+                              "Range", "bytes=0-9")
+
+    test.case("the canonical request is the six-part string")
+    match s3sig.canonical_request(example_cfg(), r, S3PayloadSha256(s3sig.S3_EMPTY_SHA256),
+                                  example_at())
+        Err(_) => test.fail("the example request is signable")
+        Ok(cr) =>
+            test.assert_eq_str(cr.uri, "/test.txt")
+            test.assert_eq_str(cr.query, "")
+            test.assert_eq_str(cr.signed_headers,
+                               "host;range;x-amz-content-sha256;x-amz-date")
+
+    test.case("and the signature is the one the specification prints")
+    match s3sig.authorize(example_cfg(), r, S3PayloadSha256(s3sig.S3_EMPTY_SHA256),
+                          example_at())
+        Err(_)  => test.fail("the example request is signable")
+        Ok(sig) =>
+            test.assert_eq_str(sig.hex,
+                               "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+
+@test
+fn test_the_signing_key_depends_on_the_day_and_not_the_instant() [io]
+    // Which is what makes it worth caching, and what makes a cached key
+    // a bug at midnight UTC.
+    let s = s3sig.scope(example_at(), "us-east-1", "s3")
+    test.case("the key's day is the scope's day")
+    test.assert_eq_str(s3sig.key_day_of(s), "20130524")
+
+    test.case("and the derivation writes into the caller's buffer")
+    match s3sig.signing_key("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", s, bytes.zeros(32))
+        Ok(k)  => test.assert(bytes.len(k) == 32)
+        Err(_) => test.fail("a 32-byte buffer holds an HMAC-SHA256")
+
+@test
+fn test_an_unsigned_payload_is_refused_over_a_plaintext_endpoint() [io]
+    // The combination has no honest use: the signature then covers the
+    // headers and not the body, and the connection protects neither.
+    // Refused rather than warned.
+    let plain = s3cfg.minio("http", "127.0.0.1", 9000, "us-east-1", example_key())
+    test.case("http plus UNSIGNED-PAYLOAD is a fault")
+    match s3sig.payload_allowed(S3PayloadUnsigned, plain)
+        Some(_) => test.assert(true)
+        None    => test.fail("an unsigned body over plaintext is refused")
+
+    test.case("and a hashed payload over the same endpoint is fine")
+    match s3sig.payload_allowed(S3PayloadSha256(s3sig.S3_EMPTY_SHA256), plain)
+        Some(_) => test.fail("a hashed body needs no transport security")
+        None    => test.assert(true)
+
+@test
+fn test_a_presign_is_refused_past_seven_days() [io]
+    // SigV4 puts a seven-day ceiling on a presigned URL.  A signer that
+    // did not refuse produces a link that works in the caller's test and
+    // fails for their user in a week, with a 403 and no explanation.
+    let r = s3req.request("GET", "examplebucket", "test.txt")
+
+    test.case("a week and a second is refused at the signer")
+    match s3sig.presign(example_cfg(), r, s3sig.S3_PRESIGN_MAX_SECONDS + 1, example_at())
+        Ok(_)  => test.fail("the ceiling is seven days")
+        Err(_) => test.assert(true)
+
+    test.case("fifteen minutes is not")
+    match s3sig.presign(example_cfg(), r, 900, example_at())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a quarter of an hour is inside the ceiling")
+
+@test
+fn test_the_addressing_style_changes_the_string_that_gets_signed() [io]
+    // Sign one style and send the other and the service answers
+    // `SignatureDoesNotMatch` — a 403 that reads exactly like a wrong
+    // secret key.  The two paths differ, and they differ here where a
+    // test can see it.
+    let virt = example_cfg()
+    let flat = s3cfg.with_addressing(virt, S3PathStyle)
+
+    test.case("virtual-host puts the bucket in the host and signs /key")
+    match s3cfg.canonical_path(virt, "examplebucket", "test.txt")
+        Ok(p)  => test.assert_eq_str(p, "/test.txt")
+        Err(_) => test.fail("the example bucket is addressable")
+
+    test.case("path-style puts it in the path")
+    match s3cfg.canonical_path(flat, "examplebucket", "test.txt")
+        Ok(p)  => test.assert_eq_str(p, "/examplebucket/test.txt")
+        Err(_) => test.fail("the example bucket is addressable")
+
+@test
+fn test_a_dotted_bucket_name_cannot_be_virtual_host_addressed_over_tls() [io]
+    // The wildcard certificate covers one label, so
+    // `my.bucket.s3.amazonaws.com` is a hostname the certificate does
+    // not match.  The style is forced, and it is forced VISIBLY,
+    // because a caller that signed a URL for somebody else has to know
+    // which spelling that URL is in.
+    test.case("a dotted name over https resolves to path-style")
+    match s3cfg.addressing_for(example_cfg(), "my.bucket")
+        S3PathStyle   => test.assert(true)
+        S3VirtualHost => test.fail("a dot cannot be a hostname label here")
+
+    test.case("an ordinary name is left alone")
+    match s3cfg.addressing_for(example_cfg(), "examplebucket")
+        S3VirtualHost => test.assert(true)
+        S3PathStyle   => test.fail("the configured style stands when it can")
+
+@test
+fn test_a_bucket_name_is_checked_before_a_round_trip_pays_for_it() [io]
+    test.case("two characters is too short")
+    test.assert(not s3cfg.bucket_name_ok("ab"))
+
+    test.case("an uppercase letter is not allowed")
+    test.assert(not s3cfg.bucket_name_ok("MyBucket"))
+
+    test.case("a name shaped like an address is not allowed")
+    test.assert(not s3cfg.bucket_name_ok("192.168.0.1"))
+
+    test.case("and an ordinary one is")
+    test.assert(s3cfg.bucket_name_ok("examplebucket"))
+
+@test
+fn test_a_skewed_clock_is_named_as_a_clock_and_not_as_access_denied() [io]
+    // S3 answers 403 for a clock more than fifteen minutes out, which
+    // is the same status it answers for a wrong secret — and sends
+    // everybody to check their credentials.  This is the check that
+    // makes the real repair visible, and it is the argument for ntp-nv
+    // in one sentence.
+    let signed = example_at()
+    let late = match arith.add_delta(signed, span.minutes(20))
+        Ok(t)  => t
+        Err(_) => signed
+
+    test.case("twenty minutes out will not verify")
+    test.assert(not s3sig.skew_ok(signed, late))
+
+    test.case("the same instant will")
+    test.assert(s3sig.skew_ok(signed, signed))
+
+    test.case("and the code for it is named")
+    test.assert(s3fault.is_retryable(S3RequestTimeTooSkewed))

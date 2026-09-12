@@ -1,0 +1,286 @@
+// s3op.nv — the operations, as request values and reply readers.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` THROUGHOUT.  Every function here either builds an `S3Request`
+// or reads an `S3Reply`.  Nothing sends anything, which is what lets a
+// caller with its own HTTP stack use this package for everything except
+// the socket — and what lets the test suite assert the exact request
+// each operation produces.
+//
+// THE PAIRING IS THE DESIGN: `<op>` builds, `read_<op>` reads.  A
+// client is then `sign, send, read`, three calls in `s3client` that are
+// the same three for every operation, and adding an operation is two
+// pure functions rather than a new method on a connection.
+//
+// LISTING IS A PAGE AND NOT AN ITERATOR.  `list` takes the
+// continuation token and `S3ListPage.next_continuation` answers the
+// next one; there is no hidden loop.  A bucket with four million
+// objects is four thousand round trips, and a caller that cannot see
+// them cannot stop, checkpoint or rate-limit them.
+
+use s3req
+
+// The floor S3 puts on every multipart part but the last: five
+// mebibytes.  Named here rather than in `s3mpu` because `put` is where
+// a caller decides between a single PUT and a multipart upload.
+pub const S3_PART_MIN_BYTES = 5242880
+
+// The ceiling on a single PUT: five gibibytes.  Above this the object
+// has to be multipart, and the failure for exceeding it arrives after
+// the whole body has been uploaded.
+pub const S3_PUT_MAX_BYTES = 5368709120
+
+// The most keys one ListObjectsV2 page may answer.
+pub const S3_LIST_MAX_KEYS = 1000
+
+// The most keys one batch delete may name.
+pub const S3_DELETE_MAX_KEYS = 1000
+
+// What a GET answered.
+pub struct S3Object
+    // The body, or empty when the reply was streamed.
+    body: Bytes
+    // With its quotes, as it arrived.
+    etag: Str
+    content_type: Str
+    content_length: Int
+    // RFC 1123, as the header wrote it.
+    last_modified: Str
+    // The `x-amz-meta-` headers, with the prefix removed.
+    metadata: [S3Header]
+    // Present on a ranged GET: first, last, total.
+    content_range: ?(Int, Int, Int)
+    // The version id, on a bucket with versioning on.
+    version_id: Str
+
+// What a HEAD answered.
+//
+// The same facts as `S3Object` without the body — a separate type
+// rather than an `S3Object` with an empty body, because an empty body
+// is also what a GET of a zero-length object answers and the two are
+// not the same thing.
+pub struct S3Head
+    etag: Str
+    content_type: Str
+    content_length: Int
+    last_modified: Str
+    metadata: [S3Header]
+    version_id: Str
+    // The storage class, when the reply named one.  An object in
+    // Glacier answers a HEAD and refuses a GET, which is a distinction
+    // a caller that only ever HEADs never discovers.
+    storage_class: Str
+
+// What a PUT answered.
+pub struct S3Put
+    etag: Str
+    version_id: Str
+
+// A GET of one object.
+//
+// ```novo
+// use s3op
+//
+// fn r(b: Str, k: Str) -> S3Request
+//     s3op.get(b, k)
+// ```
+pub fn get(bucket: Str, key: Str) -> S3Request []
+    todo("s3-nv.s3op.get")
+
+// A GET of a byte range.
+pub fn get_range(bucket: Str, key: Str, first: Int, last: Int) -> S3Request []
+    todo("s3-nv.s3op.get_range")
+
+// A GET that answers 304 when the caller's copy is still current.
+pub fn get_if_none_match(bucket: Str, key: Str, etag: Str) -> S3Request []
+    todo("s3-nv.s3op.get_if_none_match")
+
+// Read a GET's reply.
+//
+// `streamed` says whether the transport left the body on the wire; the
+// answer's `body` is then empty and the caller drains the transport.
+// The flag is an argument rather than read off the reply because it is
+// the TRANSPORT's property and not the service's.
+pub fn read_get(r: S3Reply, streamed: Bool) -> Result<S3Object, S3Fault> []
+    todo("s3-nv.s3op.read_get")
+
+// A HEAD of one object.
+//
+// A HEAD's failure has NO BODY — the method forbids one — so a 403
+// here carries no `<Code>` and `read_head` answers a fault built from
+// the status alone.  That is also why a 403 on HEAD and a 404 on HEAD
+// are indistinguishable for an object the caller may not list: S3
+// answers 403 for both rather than confirming existence.
+pub fn head(bucket: Str, key: Str) -> S3Request []
+    todo("s3-nv.s3op.head")
+
+// Read a HEAD's reply.
+pub fn read_head(r: S3Reply) -> Result<S3Head, S3Fault> []
+    todo("s3-nv.s3op.read_head")
+
+// A PUT of bytes the caller holds.
+//
+// The `Content-Type` comes from the key's extension when the caller
+// adds none; see `s3req.content_type_for` for why that matters more
+// than it looks.
+pub fn put(bucket: Str, key: Str, data: Bytes) -> S3Request []
+    todo("s3-nv.s3op.put")
+
+// A PUT of a body the caller will stream, whose hash it has.
+pub fn put_streamed(bucket: Str, key: Str, length: Int, sha256_hex: Str) -> S3Request []
+    todo("s3-nv.s3op.put_streamed")
+
+// Read a PUT's reply.
+pub fn read_put(r: S3Reply) -> Result<S3Put, S3Fault> []
+    todo("s3-nv.s3op.read_put")
+
+// A DELETE of one object.
+//
+// S3 answers 204 for a key that never existed, and that is not an
+// error: delete is idempotent by design.  `read_delete` therefore
+// cannot tell a caller whether anything was removed, and
+// `delete_if_match` is what a caller that needs to know uses.
+pub fn delete(bucket: Str, key: Str) -> S3Request []
+    todo("s3-nv.s3op.delete")
+
+// A DELETE conditional on the object's ETag.
+pub fn delete_if_match(bucket: Str, key: Str, etag: Str) -> S3Request []
+    todo("s3-nv.s3op.delete_if_match")
+
+// Read a DELETE's reply.
+pub fn read_delete(r: S3Reply) -> ?S3Fault []
+    todo("s3-nv.s3op.read_delete")
+
+// A batch DELETE of up to a thousand keys.
+//
+// POST, an XML body, and a `Content-MD5` header — which is the one
+// place in this package where MD5 is still required, because the
+// operation predates the content hash and the service still refuses a
+// batch delete without it.
+pub fn delete_many(bucket: Str, keys: [Str], quiet: Bool) -> Result<S3Request, S3Fault> []
+    todo("s3-nv.s3op.delete_many")
+
+// Read a batch DELETE's reply.
+//
+// A 200 with failures inside it is the normal shape, so the answer is
+// every outcome and the caller decides.
+pub fn read_delete_many(r: S3Reply) -> Result<[S3DeleteOutcome], S3Fault> []
+    todo("s3-nv.s3op.read_delete_many")
+
+// One page of a listing.
+//
+// `after` is `S3ListPage.next_continuation` from the previous page, or
+// `None` for the first.  `delimiter` empty lists every key; `"/"` rolls
+// the bucket up into prefixes the way a filesystem would.
+//
+// ```novo
+// use s3op
+//
+// fn first(b: Str, p: Str) -> S3Request
+//     s3op.list(b, p, "/", 1000, None)
+// ```
+pub fn list(bucket: Str, prefix: Str, delimiter: Str, max_keys: Int, after: ?Str) -> S3Request []
+    todo("s3-nv.s3op.list")
+
+// Read a listing's reply.
+pub fn read_list(r: S3Reply) -> Result<S3ListPage, S3Fault> []
+    todo("s3-nv.s3op.read_list")
+
+// Whether a listing has another page.
+//
+// One call, because it is the loop condition and because writing it
+// out gets it wrong: it is `is_truncated`, and it is never "the page
+// had entries".
+pub fn has_more(page: S3ListPage) -> Bool []
+    todo("s3-nv.s3op.has_more")
+
+// A server-side COPY.
+//
+// The source is `x-amz-copy-source`, a `/bucket/key` string that is
+// percent-encoded and is NOT the canonical URI — the encoding differs,
+// and a key with a space in it copies to the wrong place or not at all
+// when it is written by hand.  `copy_source_header` is that encoding,
+// alone, so it can be tested.
+//
+// COPY is also how an object's metadata is changed: there is no other
+// operation that does it, and the metadata directive decides whether
+// the copy keeps the source's or takes the request's.
+pub fn copy(src_bucket: Str, src_key: Str, dst_bucket: Str, dst_key: Str,
+            replace_metadata: Bool) -> S3Request []
+    todo("s3-nv.s3op.copy")
+
+// Read a COPY's reply.
+//
+// COPY IS THE OTHER OPERATION THAT ANSWERS 200 AND THEN FAILS, for the
+// same reason as a multipart completion: the copy may run for minutes
+// and the status goes out first.  A caller that checked the status
+// reports a copy that did not happen.
+pub fn read_copy(r: S3Reply) -> Result<Str, S3Fault> []
+    todo("s3-nv.s3op.read_copy")
+
+// The `x-amz-copy-source` value for a bucket and key.
+pub fn copy_source_header(bucket: Str, key: Str) -> Str []
+    todo("s3-nv.s3op.copy_source_header")
+
+// A CreateBucket request.
+pub fn create_bucket(bucket: Str, region: Str) -> Result<S3Request, S3Fault> []
+    todo("s3-nv.s3op.create_bucket")
+
+// A HEAD of a bucket, which is how existence and access are asked
+// together.
+pub fn head_bucket(bucket: Str) -> S3Request []
+    todo("s3-nv.s3op.head_bucket")
+
+// Whether an ETag names a multipart object.
+//
+// A single-PUT ETag is the MD5 of the object; a multipart ETag is the
+// MD5 of the concatenated part MD5s with `-<count>` after it, and it
+// is NOT the MD5 of anything the caller can compute from the file.  A
+// program that verified downloads by comparing the ETag to its own
+// MD5 works until the first object over five gibibytes and then
+// reports corruption on every one of them.
+//
+// ```novo
+// use s3op
+//
+// fn composite(e: Str) -> Bool
+//     s3op.etag_is_multipart(e)
+// ```
+pub fn etag_is_multipart(etag: Str) -> Bool []
+    todo("s3-nv.s3op.etag_is_multipart")
+
+// How many parts a multipart ETag names, or zero.
+pub fn etag_part_count(etag: Str) -> Int []
+    todo("s3-nv.s3op.etag_part_count")
+
+// An ETag with its quotes removed, for a caller comparing two.
+pub fn etag_unquoted(etag: Str) -> Str []
+    todo("s3-nv.s3op.etag_unquoted")
+
+// Whether a 200 reply is actually a failure document.
+//
+// The check a COMPLETE and a COPY both need: the status went out
+// before the operation finished, so the body decides.  Published
+// because a caller draining the body itself has to make the same call
+// and there is exactly one right way to make it.
+pub fn body_is_error(r: S3Reply) -> Bool []
+    todo("s3-nv.s3op.body_is_error")
+
+// The fault a non-2xx reply names.
+//
+// One function, so every `read_*` above reports the same way and a
+// service's `<Code>` reaches the caller whichever operation met it.
+pub fn fault_of_reply(r: S3Reply) -> S3Fault []
+    todo("s3-nv.s3op.fault_of_reply")
+
+// Whether conditional writes are worth attempting against a service.
+//
+// `If-Match` on a PUT is recent even at AWS and absent from several
+// compatible services, where the header is IGNORED and the write
+// succeeds — which is the worst of the three possible behaviours,
+// because a caller using it as a lock has no lock and no error.  There
+// is no way to ask a service; this answers what the endpoint is known
+// to do, and `None` is an honest third answer.
+pub fn conditional_writes_supported(cfg: S3Config) -> ?Bool []
+    todo("s3-nv.s3op.conditional_writes_supported")
