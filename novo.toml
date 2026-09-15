@@ -1,6 +1,6 @@
 [package]
 name        = "s3-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "An S3-compatible object store client: SigV4 signing and presigned URLs as pure arithmetic, put/get/head/delete/copy, ListObjectsV2 with pagination, a multipart upload the caller drives, the XML replies over xml-nv, and an endpoint value that makes AWS, MinIO and Cloudflare R2 the same three fields.  The transport is a trait, so a test drives a whole exchange with no socket.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

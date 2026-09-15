@@ -1,361 +1,370 @@
 # s3-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+Amazon S3 is an object store: a program puts an object into a bucket
+under a key and reads it back by that key, over HTTP. The requests and
+replies are the
+[S3 REST API](https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html),
+and every request is authenticated with
+[Signature Version 4](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv4-signing.html).
+This package is a client for that API, and for the services that copy
+it, such as MinIO and Cloudflare R2. It is built on
+[crypto-nv](https://novo-lang.org/packages/crypto-nv) for SHA-256 and
+HMAC, [xml-nv](https://novo-lang.org/packages/xml-nv) for the reply
+documents, [url-nv](https://novo-lang.org/packages/url-nv) for
+percent-encoding, [mime-nv](https://novo-lang.org/packages/mime-nv) for
+content types, and
+[calendar-nv](https://novo-lang.org/packages/calendar-nv) for the two
+timestamp formats a signature carries.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What an S3 object store is
 
-An S3-compatible object store client, written in novo-lang: Signature
-Version 4 as pure arithmetic over crypto-nv, the object and bucket
-operations a program actually uses, `ListObjectsV2` with pagination the
-caller drives, a multipart upload as a state machine the caller pumps,
-the XML replies over xml-nv, and an endpoint value that makes AWS,
-MinIO and Cloudflare R2 the same three fields.
+A **bucket** is a named container. A **key** is the name of one object
+inside it, up to 1024 bytes of UTF-8, and any byte is legal in one: a
+key may contain a newline, a space or a `#`. An **object** is the bytes
+plus the headers stored with them, such as `Content-Type` and the
+`x-amz-meta-` user metadata. An **ETag** is the identity the service
+returns for an object's contents.
 
-The transport is a trait, so the whole of it runs with no socket: the
-test suite signs AWS's own published worked example and gets AWS's own
-signature, and drives a complete multipart upload over a recorded
-exchange at `[]`.
+A bucket reaches the wire in one of two **addressing styles**.
+Virtual-host addressing puts the bucket in the host name,
+`https://bucket.s3.region.amazonaws.com/key`. Path-style addressing puts
+it in the path, `https://endpoint/bucket/key`. The two styles sign
+different strings, so the choice is part of the request and not a
+routing detail.
 
-It is the S3 REST API subset a program uses, not the whole of it.  The
-section at the bottom says what is out and why for each.
+Every request carries a signature. Signature Version 4 builds a
+**canonical request** from the method, the encoded path, the sorted
+query string, the sorted headers and the hash of the body; hashes it;
+prefixes the algorithm, the timestamp and a **credential scope** of day,
+region and service; and signs the result with a key derived from the
+secret by four chained HMAC-SHA256 operations. The signature therefore
+covers the body's SHA-256, which means the body has to be known before
+the first byte of it is sent.
 
-## Adding it, and checking it
+A **presigned URL** moves that signature from a header into the query
+string, so a URL can be handed to a browser or to a `curl` that holds no
+credentials.
 
-```bash
-novo pkg add s3-nv            # into your novo.toml
-novo pkg build                # type- and effect-check the package
-novo test --isolate tests/s3sig_tests.nv
+An object larger than one request can carry is uploaded as a
+**multipart upload**: the client initiates it and receives an upload id,
+sends the object in numbered parts, and completes the upload with the
+list of part numbers and their ETags. An upload that is never completed
+and never aborted leaves its parts in the bucket, reachable by no key
+and billed.
+
+| Limit | Value |
+| --- | --- |
+| Key length | 1024 bytes |
+| Bucket name | 3 to 63 characters, lowercase letters, digits, dots and hyphens |
+| Single `PUT` | 5 GiB |
+| Multipart part, every part but the last | at least 5 MiB |
+| Multipart part, largest | 5 GiB |
+| Parts in one upload | 10000 |
+| Largest object a multipart upload can produce | 5 TiB |
+| Keys in one `ListObjectsV2` page | 1000 |
+| Keys in one batch delete | 1000 |
+| User metadata, names and values together | 2 KiB |
+| Presigned URL lifetime | 7 days |
+| Clock skew a signature tolerates | 15 minutes |
+
+## Install
+
+```
+novo pkg add s3-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: s3-nv.<module>.<fn>`.  They turn
-green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
+use std.bytes
 use s3cfg
 use s3client
 
-// Put one object into a MinIO bucket and read it back.
-//
-// The transport is built once and passed to every call; the instant is
-// an argument, because nothing in the signing path reads a clock.
-fn round_trip(creds: S3Credentials, data: Bytes) -> Result<Bytes, S3Fault> [io, net, time, async]
+fn main() [io, net, time, async]
+    // The credentials are three strings the caller supplies. This
+    // package reads no environment variable unless it is asked to.
+    let creds = s3cfg.credentials("AKIAIOSFODNN7EXAMPLE",
+                                  "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+    // A MinIO deployment on this machine: path-style, plaintext.
     let cfg = s3cfg.minio("http", "127.0.0.1", 9000, "us-east-1", creds)
     let c = s3client.client(cfg)
-    let t = s3client.std_http(cfg, 30000)!
-    let at = s3client.now_civil()
 
-    let _put = s3client.put_object(c, t, "photos", "cat.jpg", data, at)!
-    let got = s3client.get_object(c, t, "photos", "cat.jpg", at)!
-    Ok(got.body)
+    // The transport every operation is sent over, with a 30 second
+    // timeout. An https endpoint is refused here; see "What is not
+    // included".
+    match s3client.std_http(cfg, 30000)
+        Err(e) => println("no transport: ${e.message()}")
+        Ok(t) =>
+            // The instant the request is signed for. This is the one
+            // function in the package that reads a clock.
+            let at = s3client.now_civil()
+
+            // Store one object, then read back what the service said.
+            match s3client.put_object(c, t, "photos", "cat.jpg",
+                                      bytes.from_str("not really a jpeg"), at)
+                Err(e)  => println("the upload failed: ${e.message()}")
+                Ok(put) => println("stored, and its etag is ${put.etag}")
 ```
 
-## The layer, and why
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: s3-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-`host`, and seven of the eight modules declare nothing.
+## What the package contains
 
-| module | row | why |
-| --- | --- | --- |
-| `s3fault` | `[]` throughout | the error codes and what is worth retrying |
-| `s3cfg` | `[]` throughout | endpoint, region, credentials, addressing style |
-| `s3sig` | `[]` throughout | SigV4: HMAC over strings the caller already holds |
-| `s3req` | `[]` throughout | a request and a reply as values |
-| `s3op` | `[]` throughout | one builder and one reader per operation |
-| `s3xml` | `[]` throughout | the reply documents, over xml-nv's tree |
-| `s3mpu` | `[]` throughout | the multipart upload state machine |
-| `s3client.send`, and every operation over it | `[e]` | effect-POLYMORPHIC: whatever the caller's transport costs |
-| `s3client.now_civil` | `[time]` | the one function in the package that reads a clock |
-| `s3client.credentials_from_env` | `[io]` | the one function that reads the environment, opt-in |
-| the `S3Transport` impl for `S3StdHttp` | `[io, net, time, async]` | `std.http`'s `HttpClient.send` row, exactly |
-
-**Why `[io, net, time, async]` and not `[net]`.**  That is
-`std.http`'s own row and not a choice this package made: `HttpClient`
-puts its deadline behind a clock, its socket behind the async runtime,
-and the socket layer itself declares `[io]`.  llm-client-nv measured
-the same four on the same surface and answered by shipping a second,
-narrower transport over `std.tls`; this package ships the trait and one
-transport, because the narrow path needs TLS and the next section is
-about why there is not one yet.
-
-**`layer = "host"` and not `layer = "core"` with `host_modules`**,
-because the subject of the package is a request that reaches a bucket.
-See "Should there be an `s3-core-nv`" below — the answer this lane
-reached is no, and the reason is worth writing down.
-
-## The load-bearing interface
-
-**`S3PayloadHash`**, and the property it encodes is that SigV4 has to
-know the body before the first byte of it is sent.
-
-The signature covers the SHA-256 of the payload.  There are exactly
-three answers to "what is that hash", and they are three different
-trades:
-
-| case | what it costs | what it buys |
-| --- | --- | --- |
-| `S3PayloadSha256(hex)` | a pass over the object before the upload starts | integrity end to end |
-| `S3PayloadUnsigned` | nothing | nothing — the body is outside the signature |
-| `S3PayloadStreaming(n)` | a chunk framing the transport has to write | integrity with no pre-pass |
-
-A library that took `Bytes` for a body chose the first for everybody,
-and an object store whose uploads have to fit in memory is not an
-object store: a five-gibibyte PUT would have been a five-gibibyte
-allocation, quietly, and the only sign of it is a program that stops
-working on large objects.  A library that defaulted to the second
-removed integrity from every upload and never said so.
-
-So the caller names one, and three rules follow from the type existing:
-
-- **`s3sig.payload_allowed` refuses `S3PayloadUnsigned` over an
-  `http://` endpoint.**  Over TLS an unsigned payload is a trade;
-  over plaintext it means anything on the path can replace the object
-  and the signature still verifies.  A refusal, not a warning.
-- **`s3req.S3Body` has four cases and not one `Bytes` field**, because
-  three of them cannot produce a hash without reading the whole body
-  first.  The type that forced that is this one.
-- **`s3sig.presign` has no payload parameter at all.**  A presigned URL
-  is signed before its body exists — the whole point is that somebody
-  else supplies one — so it is always `UNSIGNED-PAYLOAD`.  The
-  consequence is worth saying out loud: a presigned PUT authorises the
-  upload of *any* body to that key until it expires, so the lifetime is
-  the whole of the control, and `presign` refuses one past the seven-day
-  ceiling.
-
-The second decision, and the one that costs the most support time when
-it is got wrong, is **`S3Addressing` living in the configuration**.
-Virtual-host addressing signs a canonical URI of `/key` and puts the
-bucket in `Host`; path-style signs `/bucket/key`.  Sign one, send the
-other, and the service answers `SignatureDoesNotMatch` — a 403 that
-reads exactly like a wrong secret key and sends everybody to check
-their credentials first.  `s3cfg.addressing_for` also answers where the
-caller's choice cannot be honoured: a bucket name containing a dot
-cannot be virtual-host addressed over TLS, because the wildcard
-certificate covers one label, and this package forces path-style rather
-than producing a certificate error the caller reads as a network
-problem.
-
-## What the registry backend would call
-
-`orbit/orbit-registry-backend` stores every release as a small set of
-files under `<root>/packages/<name>/<version>.*` — the tarball, the
-hash, the manifest snapshot, the provenance, the facets, the publish
-time, the publisher, the generated API page and a yank marker.  Moving
-that store to an S3-compatible bucket is five calls:
-
-| what the backend does today | what it would call |
+| Module | Contents |
 | --- | --- |
-| `fs.write` the tarball and its eight sidecars | `s3client.put_object` per file, keys `packages/<name>/<version><suffix>` |
-| serve a download | `s3client.get_object`, or `s3sig.presign` and a redirect |
-| the existence check before a publish | `s3client.head_object` — the 404 that means "this version is free" |
-| rebuild `index.toml` | `s3client.list_page` with `prefix = "packages/"` and no delimiter, looped on `has_more` |
-| the yank marker | `s3client.put_object` of an empty object |
+| `s3fault` | The error codes an `<Error>` document carries, which of them are worth retrying, and the fault a caller receives. |
+| `s3cfg` | The endpoint, the region, the credentials and the addressing style, with ready-made configurations for AWS, MinIO and R2. |
+| `s3sig` | Signature Version 4: the canonical request, the string to sign, the signing key, the `Authorization` header and presigned URLs. |
+| `s3req` | A request and a reply as values: headers, query parameters, the four kinds of body, ranges and metadata. |
+| `s3op` | One request builder and one reply reader per operation: get, head, put, delete, batch delete, copy, list, create bucket. |
+| `s3xml` | The reply documents, read over xml-nv's tree, and the three request documents that are XML. |
+| `s3mpu` | The multipart upload as a state machine: the part plan, the step to send next, resuming, and the abort. |
+| `s3client` | The transport trait, one transport over the standard library's HTTP client, and one call per operation. |
 
-Three things the port would have to decide, and they are the reasons
-this is a design note rather than a patch:
+## How to choose an entry point
 
-- **The index's atomic replacement does not survive the move.**  The
-  backend writes a new `index.toml` and renames it over the old one,
-  which is atomic on a filesystem.  A `PUT` of one key is atomic in S3
-  too, so the rename is unnecessary — but the read-modify-write around
-  it is now racy between two publishing processes in a way a local
-  rename was not, which is an argument for keeping `wal.log` as the
-  authority and treating the index as a cache.
-- **A published release is permanent**, so `delete_object` has no
-  caller at all in this port.  A yank adds a marker; it removes
-  nothing.  That makes the bucket's lifecycle policy the only thing
-  that could ever delete a release, which is worth an explicit "no
-  expiry" rule on it.
-- **The tarball upload wants `S3PayloadSha256`** and not the unsigned
-  form, because the backend already computes that hash — it stores it
-  in `<version>.sha256` — and handing it to the signer costs nothing
-  and puts the archive's integrity inside the signature.
+**`s3client` is the whole client.** It signs a request, sends it over a
+transport and reads the reply. Use it unless you already own an HTTP
+stack.
 
-## Should there be an `s3-core-nv`
+**`s3op` with `s3sig` is the client without the socket.** `s3op` builds
+the request and reads the reply, `s3sig.authorize` produces the headers
+that authenticate it, and the sending is yours. Every function in both
+modules performs no input or output.
 
-**No, and this is the recommendation.**
+**`s3sig.presign` alone signs a URL.** Use it to give somebody else a
+single upload or download that needs no credentials at their end.
 
-Seven of eight modules are `[]`, which is the same ratio tls-nv used to
-argue for `tls-core-nv` — and the answer is different here, because the
-three consumers that made the TLS case do not exist for this one.
+**`s3mpu` drives an upload larger than one request.** It holds part
+numbers, ETags and a plan, and it sends nothing. An upload therefore
+survives a process restart if the caller stores the value, and
+`s3client.pump` is the loop that sends what the state machine asks for.
 
-- **A device does not talk to an object store.**  The `core` half of
-  tls-nv has a real embedded consumer: a microcontroller speaking HTTPS
-  over its own radio.  SigV4 needs SHA-256 and HMAC over arbitrary-length
-  strings, the operations need a URL and an XML parser, and the object
-  that comes back is measured in megabytes.  There is no firmware that
-  wants this and cannot have it.
-- **Nothing else terminates S3.**  A TLS state machine serves a
-  terminator, a QUIC stack and a fuzzer; there is no second consumer of
-  a canonical request.
-- **The pure half is already usable from a `host` package.**  A caller
-  that wants to sign a request and send it through its own HTTP stack
-  takes this package and calls `s3sig` and `s3op` — every one of them
-  is `[]`, and depending on a `host` package does not make the caller's
-  own functions cost anything.  What a `core` package buys over that is
-  a `core` consumer, and there is not one.
+**A transport of your own implements `S3Transport[e]`.** The four
+methods are send-and-buffer, send-and-leave-the-body, read and close.
+A transport that performs nothing costs nothing: the package's own test
+suite drives a complete exchange over a recorded reply.
 
-What is worth doing instead, and this lane is not doing it: the `[]`
-modules are arranged so that a split remains possible without moving a
-line.  `s3client` depends on the other seven and nothing depends on it.
+## The rules a user needs
 
-## What is missing, by name
+1. **The status code is not the answer; the `<Code>` element in the body
+   is.** S3 answers 403 for a wrong key, a wrong signature, a clock more
+   than fifteen minutes out and a policy refusal. `S3FaultService`
+   carries the parsed document, and `s3fault.fix_hint` writes the
+   sentence that names the repair for the three whose own message does
+   not.
+2. **The addressing style changes the string that gets signed.**
+   Virtual-host addressing signs a path of `/key` and puts the bucket in
+   `Host`; path-style signs `/bucket/key`. Sign one and send the other
+   and the service answers `SignatureDoesNotMatch`, which reads exactly
+   like a wrong secret key. `s3cfg.addressing_for` answers the style
+   that will actually be used, and forces path-style for a bucket name
+   containing a dot: a wildcard certificate covers one label, so the
+   virtual-host name would not match it.
+3. **The caller names the payload hash.** `S3PayloadSha256` costs a pass
+   over the object before the upload starts and covers the body end to
+   end. `S3PayloadUnsigned` costs nothing and leaves the body outside
+   the signature. `S3PayloadStreaming` signs each chunk, at the cost of
+   a framing the transport must write. `s3sig.payload_allowed` refuses
+   the unsigned form over a plaintext endpoint, where nothing else would
+   be protecting the body.
+4. **A presigned URL is always unsigned-payload, and `presign` takes no
+   payload argument.** The body does not exist when the URL is signed.
+   A presigned `PUT` therefore authorises the upload of any body to that
+   key until it expires, so the lifetime is the whole of the control.
+   Seven days is the ceiling, and `presign` refuses more.
+5. **`x-amz-date` is the basic ISO 8601 form.** `20130524T000000Z`: no
+   dashes and no colons. The credential scope carries the same day as
+   eight digits. An extended-form timestamp produces a signature the
+   service computes differently and a 403 with nothing in it to read.
+6. **The canonical URI and the canonical query string encode
+   differently.** The canonical URI percent-encodes every byte outside
+   `A-Za-z0-9-._~` except `/`, and for S3 it encodes once, where every
+   other AWS service encodes the path twice. The canonical query string
+   encodes `/` as well, and writes `name=` for a parameter with an empty
+   value.
+7. **A listing ends on `is_truncated` and never on an empty page.** A
+   page can hold no objects and still be truncated, when every key in
+   its range rolled up into a common prefix. `s3op.has_more` is the loop
+   condition, and `S3ListPage.next_continuation` is what the next
+   request sends. This package always asks for `encoding-type=url`,
+   because it is the only way a key containing a character XML cannot
+   carry survives the reply.
+8. **A multipart part below 5 MiB is refused at completion, after every
+   byte has been uploaded.** The service answers `EntityTooSmall` at the
+   end. `s3mpu.plan_parts` computes the sizes before anything is sent,
+   and raises the part size rather than exceeding ten thousand parts.
+9. **An upload that fails still owes an abort.** `S3MpuMustAbort`
+   carries the abort request, and the parts stay in the bucket until it
+   is sent: they appear in no listing, are reachable by no key, and are
+   billed. `s3mpu.upload_id_of` is public so the id can be stored and
+   the abort sent after a crash, and `s3mpu.abort_request` builds one
+   from the three strings alone.
+10. **A 200 on a completion or a copy can still be a failure.** The
+    service answers 200 as soon as it starts the operation, streams
+    whitespace while it works, and puts the error document inside that
+    body. `s3op.body_is_error` is the check, and `read_copy` and
+    `supply_complete` make it for you.
+11. **A multipart ETag is not the MD5 of anything the caller can
+    compute.** It is the MD5 of the concatenated part MD5s, with
+    `-<count>` after it. A program that verified downloads by comparing
+    the ETag to its own MD5 works until the first large object and then
+    reports corruption on every one. `s3op.etag_is_multipart` says which
+    kind an ETag is.
+12. **A ranged `GET` reads its total from `Content-Range`, not
+    `Content-Length`.** On that reply `Content-Length` is the length of
+    the range. `s3req.content_range_of` answers the first byte, the last
+    byte and the total. `bytes=-n` is the last n bytes and `bytes=n-` is
+    everything from offset n: the two differ by one character.
+13. **User metadata round-trips in lowercase.** S3 lowercases metadata
+    names, so `metadata_header` lowercases on the way in. The names and
+    values together must fit 2 KiB, and exceeding it is a 400 after the
+    body has been sent.
+14. **A `CreateBucket` in `us-east-1` must not name its region.** The
+    region that predates the `CreateBucketConfiguration` document is the
+    one the document may not mention, so `s3xml.write_bucket_config`
+    answers an empty body there.
+15. **`delete_object` cannot tell you whether anything was removed.**
+    S3 answers 204 for a key that never existed, because delete is
+    idempotent. `delete_if_match` is what a caller that needs to know
+    uses. A batch delete answers 200 with the per-key failures inside
+    it, and `read_delete_many` answers every outcome.
+16. **Retry is a property of the code, not of the status class.**
+    `SlowDown` and `InternalError` want a backoff; `AccessDenied` wants
+    none, ever. `s3fault.is_retryable` is the table, and
+    `fault_is_retryable` extends it to a transport failure, which is
+    retryable only for a request the caller says is idempotent. The
+    backoff, the jitter and the ceiling are the caller's.
 
-**A TLS transport, which is the honest limit of this release.**
-`std.http` routes an `https` URL to a pair of one-shot registry entries
-rather than through its own connection surface, and those entries cover
-GET and POST, answer no response headers, and synthesise a status of
-200.  An object store needs `PUT`, `HEAD` and `DELETE`; it needs the
-`ETag`, `Content-Range`, `x-amz-request-id` and `x-amz-version-id` out
-of the headers; and it needs to tell a 404 from a 403 from a 412.  None
-of that survives that path.
+## What is not included
 
-So `s3client.std_http` **refuses an `https` endpoint by name** rather
-than appearing to work against one, and what it serves is every
-deployment whose endpoint is plaintext: MinIO in a test rig, a gateway
-inside a VPC, and the whole of this package's own test story.  The row
-that closes it is **tls-nv's**: `std.http`'s own seam is one `if` that
-disappears the day a `TlsStream` implements `Read`/`Write`, and until
-then an `S3TlsHttp` over tls-nv plus http-codec-nv is the transport to
-write.  acme-nv reported the same gap from the other side, for the same
-reason — the one-shots discard the headers a protocol is carried in.
-
-**MD5, for one operation.**  A batch `DeleteObjects` still requires a
-`Content-MD5` header; crypto-nv publishes `md5`, so this is not a
-missing row, but it is the one place in a package built on SHA-256
-where MD5 is not optional and it is worth knowing before somebody
-removes it.
-
-**Nothing else.**  Every other primitive this package needs —
-SHA-256, HMAC-SHA256, percent-encoding, XML, civil dates, media
-types — is published on the grid today.
-
-## Where a row wanted to widen
-
-**`[io]` for `credentials_from_env`.**  The package's own row is
-`[io, net, time, async]` through the transport, so the label was
-already there; what is worth recording is that the function exists at
-all.  Reading `AWS_ACCESS_KEY_ID` is what every other S3 client does by
-default, and doing it by default would decide, for every program that
-links this, that an environment variable is a credential source — which
-is wrong for a server with an instance metadata endpoint and wrong for
-a CLI with a profile file.  So it is one opt-in function with its own
-label, and the default is that the caller supplies the three strings.
-
-**`[time]` for one clock read.**  Every function in `s3sig` takes the
-instant it signs for, because AWS publishes worked examples with a
-fixed timestamp and a signer that read its own clock could not be run
-against them.  `s3client.now_civil` is the single function that
-produces one.  Same shape as tls-nv's `now_civil`, smtp-nv's `now_ms`
-and postgres-nv's — the cohort now has four instances of this pattern
-and it is worth naming as one.
-
-**No effect parameter wanted a second one.**  `s3client`'s generic
-functions bind exactly one, over the transport, and nothing else in the
-package wanted to be polymorphic at the same time — which is the
-difference between this package and tls-nv, where the signature checker
-and the byte pipe both did.
-
-## What this does not do, on purpose
-
-- **No bucket policies, ACLs, CORS, lifecycle, versioning
-  configuration, replication, encryption configuration, tagging,
-  inventory, analytics or logging.**  Every one of them is a separate
-  XML document with its own schema, and none of them is on the path
-  a program takes to read and write objects.  They are `s3-admin-nv`
-  if anybody wants them.
-- **No STS, no instance metadata, no profile files and no credential
-  chain.**  The credentials are three strings the caller supplies.  A
-  chain is a policy about where secrets come from, and a library that
-  chose one decides it for every program that links it.
-- **No `list_all`.**  A bucket with four million objects is four
-  thousand round trips; a function that hid them behind one call could
-  not be stopped, checkpointed or rate-limited, and would return an
-  array nobody sized.  The loop is five lines in the caller.
-- **No retry loop.**  `s3fault.is_retryable` and
-  `s3fault.fault_is_retryable` answer the question; the backoff, the
-  jitter and the ceiling are the caller's, and `S3SlowDown` on a
-  thousand-key upload is a decision about throughput rather than a
-  library default.
-- **No signature version 2.**  It is deprecated everywhere and accepted
+- **A TLS transport.** The standard library's HTTP client routes an
+  `https` URL through one-shot entries that cover `GET` and `POST`,
+  answer no response headers and report a status of 200. An object store
+  needs `PUT`, `HEAD` and `DELETE`, the `ETag` and `Content-Range`
+  headers, and the difference between a 404, a 403 and a 412.
+  `s3client.std_http` therefore refuses an `https` endpoint by name
+  rather than appearing to work against one. What it does serve is every
+  plaintext endpoint: MinIO in a test rig, a gateway inside a private
+  network, and this package's own tests. A transport over
+  [tls-nv](https://novo-lang.org/packages/tls-nv) closes the gap, and a
+  caller may supply one today by implementing `S3Transport`.
+- **Bucket policies, ACLs, CORS, lifecycle, versioning configuration,
+  replication, encryption configuration, tagging, inventory, analytics
+  and logging.** Each is a separate XML document with its own schema,
+  and none of them is on the path a program takes to read and write
+  objects.
+- **STS, instance metadata, profile files and a credential chain.** The
+  credentials are three strings the caller supplies.
+  `s3client.credentials_from_env` reads `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, and it is one opt-in
+  function rather than a default, because where secrets come from is the
+  program's decision.
+- **A function that lists a whole bucket.** A bucket with four million
+  objects is four thousand round trips. A single call could not be
+  stopped, checkpointed or rate-limited, and would answer an array
+  nobody sized. The loop is a few lines in the caller.
+- **A retry loop.** `s3fault.is_retryable` answers the question; the
+  schedule is the caller's.
+- **Signature Version 2.** It is deprecated everywhere and accepted
   nowhere new.
-- **No device claim.**  The package is `host`, and the section above
-  says why a `core` split would have no consumer.
-- **It does not print.**  Every failure is a value with a `message()`.
+- **MD5 as a general dependency.** One operation still requires it: a
+  batch `DeleteObjects` carries a `Content-MD5` header. crypto-nv
+  publishes `md5`, so nothing else is needed, but this is the one place
+  in a package built on SHA-256 where MD5 is not optional.
+- **Printing.** Every failure is a value with a `message()`.
 
-## The reference implementation
+## Related packages
 
-`aws-sdk-s3` for the operation surface and `boto3` for the subset —
-`put_object`, `get_object`, `head_object`, `delete_object`,
-`delete_objects`, `copy_object`, `list_objects_v2` and the multipart
-family are boto3's own names for the same eight things, and the
-canonical request, string to sign and signing-key derivation come
-straight from AWS's Signature Version 4 specification along with its
-worked examples, which `tests/s3sig_tests.nv` asserts against.
+- [crypto-nv](https://novo-lang.org/packages/crypto-nv) is SHA-256,
+  HMAC-SHA256 and the constant-time comparison the whole of Signature
+  Version 4 is built from, and the `md5` a batch delete needs.
+- [xml-nv](https://novo-lang.org/packages/xml-nv) parses the documents.
+  `s3xml` is a reader over its tree and parses no XML itself, so a reply
+  carrying an element this package has never seen still parses.
+- [url-nv](https://novo-lang.org/packages/url-nv) supplies the two
+  percent-encodings rule 6 keeps apart.
+- [mime-nv](https://novo-lang.org/packages/mime-nv) answers the
+  `Content-Type` a `put` sends when the caller names none. S3 serves
+  back whatever it was given, so a bucket uploaded without one serves a
+  website that downloads its own pages.
+- [calendar-nv](https://novo-lang.org/packages/calendar-nv) is the civil
+  date and time every signing function takes as an argument.
+- [tls-nv](https://novo-lang.org/packages/tls-nv) is the transport
+  security this package's shipped transport does not have. Take it, with
+  [http-codec-nv](https://novo-lang.org/packages/http-codec-nv), to
+  write an `S3Transport` that reaches an `https` endpoint.
+- [acme-nv](https://novo-lang.org/packages/acme-nv) is the other host
+  package that signs every request it sends, with JSON Web Signature
+  rather than Signature Version 4, against a certificate authority
+  rather than an object store.
+- `std.http` in the standard library is the HTTP client the shipped
+  transport uses. A program that wants only plaintext needs nothing
+  else.
 
-Four things change in the port.
+## Tests
 
-`boto3` hides pagination behind a paginator and `aws-sdk-s3` behind a
-stream; here a page is a value and the loop is the caller's, for the
-reason the previous section gives.
+```bash
+novo test tests/s3sig_tests.nv       # 14 tests: the signature and the configuration
+novo test tests/s3flow_tests.nv      # 17 tests: the operations, the listing, the upload
+novo test tests/s3surface_tests.nv   # 9 tests: every public name, spelled as a consumer would
+```
 
-`boto3`'s `TransferManager` runs a multipart upload for you, in threads
-it owns, and reports progress through a callback; here `s3mpu` is a
-state machine with no threads and no I/O, so a resumable upload across
-a process restart is a matter of storing the value and a parallel one
-is the caller's scheduler rather than this package's.
+The signature the suite asserts is AWS's own, from the Signature Version
+4 worked example: a `GET` of `test.txt` from `examplebucket` in
+`us-east-1` at `20130524T000000Z`, with the canonical request, the
+string to sign and the signature each step produces. Nothing in the
+signing path reads a clock, so that example reproduces exactly. The
+operation tests assert the request each builder produces and the reply
+each reader accepts, over a transport that implements `S3Transport[]`:
+the compiler checks, before any assertion runs, that seven of the eight
+modules reach no socket.
 
-Both SDKs build a credential chain — environment, profile, container,
-instance metadata — and both make it the default.  Here the credentials
-are arguments and `credentials_from_env` is one opt-in function, for
-the reason the widening section gives.
+The tests compile today and fail at run, each on the
+`not implemented: s3-nv.<module>.<fn>` panic that is its body. They turn
+green one at a time as bodies land.
 
-And both expose the payload hash as a configuration flag buried in a
-client constructor.  Here it is a type in the signature of the function
-that signs, because it is the decision that determines whether an
-upload is covered by anything at all.
+## Implementation status
 
-## Status
-
-| item | implemented |
+| Item | Implemented |
 | --- | --- |
-| `s3fault` — `S3ErrorCode`, `S3ErrorDoc`, `S3Fault` | types only |
-| `s3fault.code_of_text`, `.code_text`, `.is_retryable`, `.fault_is_retryable`, `.fix_hint`, `.empty_doc`, `.is_no_such_key`, the `message` impl | no |
-| `s3cfg` — `S3Addressing`, `S3Endpoint`, `S3Credentials`, `S3Config` | types only |
-| `s3cfg.aws`, `.minio`, `.r2`, `.endpoint_of_url`, `.credentials`, `.temporary_credentials` | no |
-| `s3cfg.with_addressing`, `.with_region`, `.host_header`, `.canonical_path`, `.origin`, `.addressing_for` | no |
-| `s3cfg.bucket_name_ok`, `.key_ok`, `.is_plaintext` | no |
-| `s3sig` — `S3PayloadHash`, `S3CanonicalRequest`, `S3Scope`, `S3Signature` | types only |
-| `s3sig.S3_SIGV4_ALGORITHM`, `.S3_UNSIGNED_PAYLOAD`, `.S3_STREAMING_PAYLOAD`, `.S3_EMPTY_SHA256`, `.S3_PRESIGN_MAX_SECONDS`, `.S3_CLOCK_SKEW_SECONDS` | yes — they are constants |
+| The `S3_*` constants in `s3sig`, `s3op` and `s3mpu` | yes (they are constants) |
+| `s3fault.code_of_text`, `.code_text`, `.is_retryable`, `.fault_is_retryable`, `.fix_hint`, `.empty_doc`, `.is_no_such_key`, `.S3Fault.message` | no |
+| `s3cfg.aws`, `.minio`, `.r2`, `.endpoint_of_url`, `.credentials`, `.temporary_credentials`, `.with_addressing`, `.with_region` | no |
+| `s3cfg.host_header`, `.canonical_path`, `.origin`, `.addressing_for`, `.bucket_name_ok`, `.key_ok`, `.is_plaintext` | no |
 | `s3sig.amz_date`, `.amz_day`, `.scope`, `.scope_text`, `.payload_of_body`, `.payload_text`, `.payload_allowed` | no |
 | `s3sig.canonical_uri`, `.canonical_query`, `.canonical_headers`, `.signed_headers`, `.canonical_request`, `.canonical_text` | no |
 | `s3sig.string_to_sign`, `.signing_key`, `.key_day_of`, `.sign`, `.authorize`, `.authorization_headers` | no |
 | `s3sig.presign`, `.presign_expiry`, `.skew_ok`, `.service_time_of` | no |
-| `s3req` — `S3Header`, `S3QueryPair`, `S3Body`, `S3Request`, `S3Reply` | types only |
 | `s3req.request`, `.with_query`, `.with_header`, `.with_body`, `.with_bytes`, `.body_length` | no |
 | `s3req.header_of`, `.request_header_of`, `.range_header`, `.range_from`, `.range_suffix`, `.content_range_of` | no |
 | `s3req.content_type_for`, `.metadata_header`, `.metadata_of`, `.metadata_fits`, `.if_match_header`, `.if_none_match_any` | no |
-| `s3op` — `S3Object`, `S3Head`, `S3Put` | types only |
-| `s3op.S3_PART_MIN_BYTES`, `.S3_PUT_MAX_BYTES`, `.S3_LIST_MAX_KEYS`, `.S3_DELETE_MAX_KEYS` | yes — they are constants |
 | `s3op.get`, `.get_range`, `.get_if_none_match`, `.read_get`, `.head`, `.read_head` | no |
 | `s3op.put`, `.put_streamed`, `.read_put`, `.delete`, `.delete_if_match`, `.read_delete` | no |
 | `s3op.delete_many`, `.read_delete_many`, `.list`, `.read_list`, `.has_more` | no |
 | `s3op.copy`, `.read_copy`, `.copy_source_header`, `.create_bucket`, `.head_bucket` | no |
 | `s3op.etag_is_multipart`, `.etag_part_count`, `.etag_unquoted`, `.body_is_error`, `.fault_of_reply`, `.conditional_writes_supported` | no |
-| `s3xml` — `S3ListEntry`, `S3ListPage`, `S3UploadStart`, `S3PartInfo`, `S3UploadDone`, `S3DeleteOutcome` | types only |
 | `s3xml.is_s3_document`, `.error_doc`, `.list_result`, `.upload_start`, `.upload_done`, `.list_parts`, `.parts_truncated` | no |
 | `s3xml.delete_result`, `.copy_result`, `.write_completion`, `.write_delete`, `.write_bucket_config` | no |
-| `s3mpu` — `S3MpuState`, `S3MpuStep`, `S3MpuPart`, `S3Mpu` | types only |
-| `s3mpu.S3_MAX_PARTS`, `.S3_PART_MAX_BYTES`, `.S3_OBJECT_MAX_BYTES` | yes — they are constants |
 | `s3mpu.part_size_ok`, `.plan_parts`, `.planned_part_size`, `.needs_multipart`, `.upload`, `.resume` | no |
 | `s3mpu.step`, `.supply_start`, `.supply_part`, `.supply_complete`, `.fail`, `.abort`, `.abort_request` | no |
 | `s3mpu.list_parts_request`, `.list_uploads_request`, `.upload_id_of`, `.state_of`, `.parts_of`, `.progress_of`, `.owes_abort`, `.completion` | no |
-| `s3client` — `S3Transport[e]`, `S3StdHttp`, `S3Client` | types only |
-| `s3client.client`, `.std_http`, `.send`, `.open` | no |
+| `s3client.client`, `.std_http`, `.send`, `.open`, and the `S3Transport` implementation for `S3StdHttp` | no |
 | `s3client.get_object`, `.get_range`, `.head_object`, `.put_object`, `.delete_object`, `.copy_object`, `.list_page` | no |
-| `s3client.pump`, `.abort_upload`, `.drain_into`, `.now_civil`, `.credentials_from_env`, the `S3Transport` impl | no |
+| `s3client.pump`, `.abort_upload`, `.drain_into`, `.now_civil`, `.credentials_from_env` | no |
+
+## Licence
+
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
