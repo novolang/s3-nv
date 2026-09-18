@@ -7,7 +7,11 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## 0.0.2 — 2026-09-15
 
-README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+README rewritten to the package README style guide (docs/writing-a-readme.md); no
+change to this package's own interface.  The xml-nv range moves to `^0.0.2`, the
+version whose `XmlFault` declares the `impl Error` that
+`Result<_, xmlerror.XmlFault>` has required since SPEC § 3.4 and that the
+compiler now enforces across modules.
 
 ## 0.0.1 — 2026-09-12
 

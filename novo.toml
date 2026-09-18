@@ -52,7 +52,7 @@ crypto-nv = "^0.1"
 # InitiateMultipartUploadResult, CompleteMultipartUploadResult and
 # DeleteResult.  `s3xml` is a reader over this package's tree and
 # parses no XML of its own.
-xml-nv = "^0.0.1"
+xml-nv = "^0.0.2"
 
 # Percent-encoding, and the reason it is a dependency rather than four
 # lines here: SigV4's canonical URI and its canonical query string use
