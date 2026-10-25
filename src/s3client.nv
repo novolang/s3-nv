@@ -39,6 +39,11 @@
 
 use s3mpu
 use s3sig
+use s3cfg
+use s3fault
+use s3op
+use s3req
+use s3xml
 
 // A transport one S3 exchange can be driven over.
 //

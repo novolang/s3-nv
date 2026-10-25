@@ -28,6 +28,8 @@
 // demonstrate rather than assert.
 
 // How a bucket reaches the wire.
+use s3fault
+
 pub enum S3Addressing
     // `https://<bucket>.s3.<region>.amazonaws.com/<key>`.  What AWS
     // wants, and what a bucket whose name contains a dot cannot use

@@ -20,6 +20,9 @@
 // them cannot stop, checkpoint or rate-limit them.
 
 use s3req
+use s3cfg
+use s3fault
+use s3xml
 
 // The floor S3 puts on every multipart part but the last: five
 // mebibytes.  Named here rather than in `s3mpu` because `put` is where

@@ -21,6 +21,7 @@ use s3mpu
 use s3op
 use s3req
 use civil
+use s3xml
 
 // A transport with no socket in it.
 //

@@ -45,6 +45,8 @@
 // the first object in a folder.
 
 use s3cfg
+use s3fault
+use s3req
 
 // The algorithm string, in the `Authorization` header and in the
 // string to sign.

@@ -29,6 +29,10 @@
 // built rather than from the service an hour later.
 
 // The largest number of parts one upload may have.
+use s3fault
+use s3req
+use s3xml
+
 pub const S3_MAX_PARTS = 10000
 
 // The largest a single part may be: five gibibytes.

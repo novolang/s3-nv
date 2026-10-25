@@ -25,6 +25,8 @@
 // raw XML elsewhere is not misled.
 
 // One object in a listing.
+use s3fault
+
 pub struct S3ListEntry
     // The key, already decoded when the listing was URL-encoded.
     key: Str
