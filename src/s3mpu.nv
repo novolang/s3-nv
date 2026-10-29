@@ -1,7 +1,5 @@
 // s3mpu.nv — a multipart upload as a state machine the caller drives.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  The upload holds no socket and no file; it holds
 // part numbers, ETags and a plan.  The caller does the sending, which
 // is what makes a resumable upload across a process restart a matter of
@@ -28,11 +26,15 @@
 // picks its own sizes gets `S3FaultPartTooSmall` before a request is
 // built rather than from the service an hour later.
 
-// The largest number of parts one upload may have.
+use std.list
+use std.str
+use s3cfg
 use s3fault
+use s3op
 use s3req
 use s3xml
 
+// The largest number of parts one upload may have.
 pub const S3_MAX_PARTS = 10000
 
 // The largest a single part may be: five gibibytes.
@@ -95,6 +97,75 @@ pub struct S3Mpu
     parts: [S3MpuPart]
     // How many parts carry an ETag.
     uploaded: Int
+    // The failure `fail` recorded, which `step` turns into a terminal
+    // step.  A field because the value that carries the failure is the
+    // upload itself: `fail` answers an `S3Mpu`.
+    failure: ?S3Fault
+    // What the service answered to the completion.  A field because
+    // `supply_complete` answers the document and not the upload, and a
+    // pump that drops it has finished an upload and lost its ETag.
+    outcome: ?S3UploadDone
+
+// The fault for an object past the five-tebibyte ceiling, spelled as
+// the code the service would answer with.  Refused before a byte is
+// sent.
+fn too_large(total: Int) -> S3Fault
+    S3FaultService(400, S3ErrorDoc { code: S3EntityTooLarge,
+                                     message: "an object of ${total} bytes exceeds the multipart ceiling",
+                                     resource: "", request_id: "", host_id: "" })
+
+// The fault for an upload id the service no longer holds.
+fn no_upload(why: Str) -> S3Fault
+    S3FaultService(404, S3ErrorDoc { code: S3NoSuchUpload, message: why, resource: "",
+                                     request_id: "", host_id: "" })
+
+fn find_part(parts: [S3MpuPart], number: Int) -> ?S3MpuPart
+    var found: ?S3MpuPart = None
+    for p in parts
+        if p.number == number
+            found = Some(p)
+    found
+
+fn with_etag(parts: [S3MpuPart], number: Int, etag: Str) -> [S3MpuPart]
+    var out: [S3MpuPart] = []
+    for p in parts
+        if p.number == number
+            out = list.concat(out, [S3MpuPart { number: p.number, offset: p.offset, length: p.length, etag: etag }])
+        else
+            out = list.concat(out, [p])
+    out
+
+fn count_etags(parts: [S3MpuPart]) -> Int
+    var n = 0
+    for p in parts
+        if p.etag != ""
+            n = n + 1
+    n
+
+// An open upload with every part stored is a full one.
+fn settled(u: S3Mpu) -> S3Mpu
+    if u.uploaded == list.len(u.parts)
+        S3Mpu { bucket: u.bucket, key: u.key, upload_id: u.upload_id, state: S3MpuFull,
+                total: u.total, parts: u.parts, uploaded: u.uploaded, failure: u.failure,
+                outcome: u.outcome }
+    else
+        u
+
+// The request for the first part with no ETag.
+fn next_part(u: S3Mpu) -> S3MpuStep
+    var pending: ?S3MpuPart = None
+    for p in u.parts
+        if pending == None and p.etag == ""
+            pending = Some(p)
+    match pending
+        None    => S3MpuFailed(no_upload("the upload has no part left to send"))
+        Some(p) =>
+            let r = s3req.with_body(
+                s3req.with_query(s3req.with_query(s3req.request("PUT", u.bucket, u.key),
+                                                  "partNumber", str.from_int(p.number)),
+                                 "uploadId", u.upload_id),
+                S3BodyStreamedUnhashed(p.length))
+            S3MpuSendPart(p.number, p.offset, p.length, r)
 
 // Whether a size is legal for a part that is not the last.
 //
@@ -105,7 +176,7 @@ pub struct S3Mpu
 //     s3mpu.part_size_ok(n)
 // ```
 pub fn part_size_ok(size: Int) -> Bool []
-    todo("s3-nv.s3mpu.part_size_ok")
+    size >= s3op.S3_PART_MIN_BYTES and size <= S3_PART_MAX_BYTES
 
 // The part sizes for an object of `total` bytes at a preferred size.
 //
@@ -129,11 +200,41 @@ pub fn part_size_ok(size: Int) -> Bool []
 //     s3mpu.plan_parts(n, 8388608)
 // ```
 pub fn plan_parts(total: Int, preferred: Int) -> Result<[S3MpuPart], S3Fault> []
-    todo("s3-nv.s3mpu.plan_parts")
+    match planned_part_size(total, preferred)
+        Err(f)   => Err(f)
+        Ok(size) =>
+            var parts: [S3MpuPart] = []
+            var offset = 0
+            var number = 1
+            while offset < total
+                let length = if total - offset < size
+                    total - offset
+                else
+                    size
+                parts = list.concat(parts, [S3MpuPart { number: number, offset: offset, length: length, etag: "" }])
+                offset = offset + length
+                number = number + 1
+            Ok(parts)
 
 // The part size `plan_parts` would use.
 pub fn planned_part_size(total: Int, preferred: Int) -> Result<Int, S3Fault> []
-    todo("s3-nv.s3mpu.planned_part_size")
+    if total < 1
+        Err(S3FaultPartTooSmall(1, total))
+    else if total > S3_OBJECT_MAX_BYTES
+        Err(too_large(total))
+    else if preferred < s3op.S3_PART_MIN_BYTES
+        Err(S3FaultPartTooSmall(1, preferred))
+    else
+        let wanted = if preferred > S3_PART_MAX_BYTES
+            S3_PART_MAX_BYTES
+        else
+            preferred
+        let needed = (total + S3_MAX_PARTS - 1) / S3_MAX_PARTS
+        if needed <= wanted
+            Ok(wanted)
+        else
+            // Whole mebibytes, so the part size a caller sees is a round one.
+            Ok((needed + 1048575) / 1048576 * 1048576)
 
 // Whether an object of this size needs a multipart upload at all.
 //
@@ -141,11 +242,18 @@ pub fn planned_part_size(total: Int, preferred: Int) -> Result<Int, S3Fault> []
 // liability, and a client that used multipart for everything pays both
 // for a file of four kilobytes.
 pub fn needs_multipart(total: Int) -> Bool []
-    todo("s3-nv.s3mpu.needs_multipart")
+    total > s3op.S3_PUT_MAX_BYTES
 
 // A fresh upload for an object of `total` bytes.
 pub fn upload(bucket: Str, key: Str, total: Int, preferred_part: Int) -> Result<S3Mpu, S3Fault> []
-    todo("s3-nv.s3mpu.upload")
+    if not s3cfg.key_ok(key)
+        Err(S3FaultBadKey(key))
+    else
+        match plan_parts(total, preferred_part)
+            Err(f)    => Err(f)
+            Ok(parts) =>
+                Ok(S3Mpu { bucket: bucket, key: key, upload_id: "", state: S3MpuFresh, total: total,
+                           parts: parts, uploaded: 0, failure: None, outcome: None })
 
 // An upload resumed from an id and the parts a `ListParts` reported.
 //
@@ -154,7 +262,29 @@ pub fn upload(bucket: Str, key: Str, total: Int, preferred_part: Int) -> Result<
 // rather than sending eight hundred parts again.
 pub fn resume(bucket: Str, key: Str, upload_id: Str, total: Int, preferred_part: Int,
               known: [S3PartInfo]) -> Result<S3Mpu, S3Fault> []
-    todo("s3-nv.s3mpu.resume")
+    if upload_id == ""
+        Err(S3FaultBadXml("a resumed upload needs its upload id"))
+    else
+        match upload(bucket, key, total, preferred_part)
+            Err(f) => Err(f)
+            Ok(u)  =>
+                var parts = list.clone(u.parts)
+                var bad: ?S3Fault = None
+                for k in known
+                    match find_part(parts, k.part_number)
+                        None    =>
+                            bad = Some(S3FaultBadXml("ListParts named part ${k.part_number}, which the plan does not have"))
+                        Some(p) =>
+                            if p.length != k.size
+                                bad = Some(S3FaultBadXml("ListParts says part ${k.part_number} is ${k.size} bytes and the plan says ${p.length}"))
+                            else
+                                parts = with_etag(parts, k.part_number, k.etag)
+                match bad
+                    Some(f) => Err(f)
+                    None    => Ok(settled(S3Mpu { bucket: bucket, key: key, upload_id: upload_id,
+                                               state: S3MpuOpen, total: total, parts: parts,
+                                               uploaded: count_etags(parts), failure: None,
+                                               outcome: None }))
 
 // What to do next.
 //
@@ -168,11 +298,46 @@ pub fn resume(bucket: Str, key: Str, upload_id: Str, total: Int, preferred_part:
 //     s3mpu.step(u)
 // ```
 pub fn step(u: S3Mpu) -> S3MpuStep []
-    todo("s3-nv.s3mpu.step")
+    match u.failure
+        Some(f) =>
+            if owes_abort(u)
+                S3MpuMustAbort(f, abort_request(u.bucket, u.key, u.upload_id))
+            else
+                S3MpuFailed(f)
+        None    =>
+            match u.state
+                S3MpuFresh   =>
+                    let r = s3req.with_header(s3req.with_query(s3req.request("POST", u.bucket, u.key), "uploads", ""),
+                                              "Content-Type", s3req.content_type_for(u.key))
+                    S3MpuSendInitiate(r)
+                S3MpuOpen    => next_part(u)
+                S3MpuFull    =>
+                    match completion(u)
+                        Err(f)   => S3MpuMustAbort(f, abort_request(u.bucket, u.key, u.upload_id))
+                        Ok(done) =>
+                            let r = s3req.with_bytes(s3req.with_query(s3req.request("POST", u.bucket, u.key),
+                                                                      "uploadId", u.upload_id),
+                                                     s3xml.write_completion(done))
+                            S3MpuSendComplete(r)
+                S3MpuDone    =>
+                    match u.outcome
+                        Some(done) => S3MpuFinished(done)
+                        None       => S3MpuFinished(S3UploadDone { location: "", bucket: u.bucket, key: u.key, etag: "" })
+                S3MpuAborted => S3MpuFailed(no_upload("the upload was aborted"))
 
 // Hand back the reply to `S3MpuSendInitiate`.
 pub fn supply_start(u: S3Mpu, r: S3Reply) -> Result<S3Mpu, S3Fault> []
-    todo("s3-nv.s3mpu.supply_start")
+    if u.state != S3MpuFresh
+        Err(S3FaultBadXml("the upload was already initiated"))
+    else if r.status < 200 or r.status > 299
+        Err(s3op.fault_of_reply(r))
+    else
+        match s3xml.upload_start(r.body)
+            Err(f)    => Err(f)
+            Ok(start) =>
+                Ok(S3Mpu { bucket: u.bucket, key: u.key, upload_id: start.upload_id, state: S3MpuOpen,
+                           total: u.total, parts: u.parts, uploaded: u.uploaded, failure: u.failure,
+                           outcome: u.outcome })
 
 // Hand back the reply to `S3MpuSendPart`.
 //
@@ -180,7 +345,20 @@ pub fn supply_start(u: S3Mpu, r: S3Reply) -> Result<S3Mpu, S3Fault> []
 // carried no ETag is a part the service did not keep, however friendly
 // its status was.
 pub fn supply_part(u: S3Mpu, number: Int, r: S3Reply) -> Result<S3Mpu, S3Fault> []
-    todo("s3-nv.s3mpu.supply_part")
+    if r.status < 200 or r.status > 299
+        Err(s3op.fault_of_reply(r))
+    else
+        match find_part(u.parts, number)
+            None    => Err(S3FaultPartOutOfOrder(number, 0))
+            Some(_) =>
+                match s3req.header_of(r.headers, "etag")
+                    None       => Err(S3FaultBadXml("the reply to part ${number} carried no ETag"))
+                    Some(etag) =>
+                        let parts = with_etag(u.parts, number, etag)
+                        Ok(settled(S3Mpu { bucket: u.bucket, key: u.key, upload_id: u.upload_id,
+                                           state: S3MpuOpen, total: u.total, parts: parts,
+                                           uploaded: count_etags(parts), failure: u.failure,
+                                           outcome: u.outcome }))
 
 // Hand back the reply to `S3MpuSendComplete`.
 //
@@ -188,7 +366,10 @@ pub fn supply_part(u: S3Mpu, number: Int, r: S3Reply) -> Result<S3Mpu, S3Fault> 
 // and then streams whitespace while it works, and the failure arrives
 // inside that body.
 pub fn supply_complete(u: S3Mpu, r: S3Reply) -> Result<S3UploadDone, S3Fault> []
-    todo("s3-nv.s3mpu.supply_complete")
+    if r.status < 200 or r.status > 299
+        Err(s3op.fault_of_reply(r))
+    else
+        s3xml.upload_done(r.body)
 
 // Record an out-of-band failure and move to the state that owes an
 // abort.
@@ -198,7 +379,8 @@ pub fn supply_complete(u: S3Mpu, r: S3Reply) -> Result<S3UploadDone, S3Fault> []
 // `S3MpuMustAbort` rather than the caller having to know that it should
 // abort.
 pub fn fail(u: S3Mpu, f: S3Fault) -> S3Mpu []
-    todo("s3-nv.s3mpu.fail")
+    S3Mpu { bucket: u.bucket, key: u.key, upload_id: u.upload_id, state: u.state, total: u.total,
+            parts: u.parts, uploaded: u.uploaded, failure: Some(f), outcome: u.outcome }
 
 // The abort request for an upload, whatever state it is in.
 //
@@ -206,7 +388,10 @@ pub fn fail(u: S3Mpu, f: S3Fault) -> S3Mpu []
 // crash, with no `S3Mpu` at all — which is why `abort_request` takes
 // the three strings rather than the value.
 pub fn abort(u: S3Mpu) -> Result<S3Request, S3Fault> []
-    todo("s3-nv.s3mpu.abort")
+    if u.upload_id == ""
+        Err(no_upload("nothing was initiated, so there is nothing to abort"))
+    else
+        Ok(abort_request(u.bucket, u.key, u.upload_id))
 
 // The abort request from an upload id alone.
 //
@@ -217,11 +402,15 @@ pub fn abort(u: S3Mpu) -> Result<S3Request, S3Fault> []
 //     s3mpu.abort_request(b, k, id)
 // ```
 pub fn abort_request(bucket: Str, key: Str, upload_id: Str) -> S3Request []
-    todo("s3-nv.s3mpu.abort_request")
+    s3req.with_query(s3req.request("DELETE", bucket, key), "uploadId", upload_id)
 
 // A request that lists the parts already uploaded, for a resume.
 pub fn list_parts_request(bucket: Str, key: Str, upload_id: Str, after: Int) -> S3Request []
-    todo("s3-nv.s3mpu.list_parts_request")
+    let r = s3req.with_query(s3req.request("GET", bucket, key), "uploadId", upload_id)
+    if after > 0
+        s3req.with_query(r, "part-number-marker", str.from_int(after))
+    else
+        r
 
 // A request that lists the unfinished uploads in a bucket.
 //
@@ -229,23 +418,27 @@ pub fn list_parts_request(bucket: Str, key: Str, upload_id: Str, after: Int) -> 
 // and the reason a library should publish it rather than leave it to
 // the console.
 pub fn list_uploads_request(bucket: Str, prefix: Str) -> S3Request []
-    todo("s3-nv.s3mpu.list_uploads_request")
+    let r = s3req.with_query(s3req.request("GET", bucket, ""), "uploads", "")
+    if prefix != ""
+        s3req.with_query(r, "prefix", prefix)
+    else
+        r
 
 // The upload id, for a caller storing it across a restart.
 pub fn upload_id_of(u: S3Mpu) -> Str []
-    todo("s3-nv.s3mpu.upload_id_of")
+    u.upload_id
 
 // Where the upload is.
 pub fn state_of(u: S3Mpu) -> S3MpuState []
-    todo("s3-nv.s3mpu.state_of")
+    u.state
 
 // The plan, for a caller reading its own file.
 pub fn parts_of(u: S3Mpu) -> [S3MpuPart] []
-    todo("s3-nv.s3mpu.parts_of")
+    list.clone(u.parts)
 
 // How many parts have been uploaded, and how many there are.
 pub fn progress_of(u: S3Mpu) -> (Int, Int) []
-    todo("s3-nv.s3mpu.progress_of")
+    (u.uploaded, list.len(u.parts))
 
 // Whether this upload has parts stored in the bucket.
 //
@@ -253,7 +446,7 @@ pub fn progress_of(u: S3Mpu) -> (Int, Int) []
 // cleaning up.  True from the moment `initiate` succeeded, because a
 // zero-part upload is still an upload id that has to be aborted.
 pub fn owes_abort(u: S3Mpu) -> Bool []
-    todo("s3-nv.s3mpu.owes_abort")
+    u.upload_id != "" and u.state != S3MpuDone and u.state != S3MpuAborted
 
 // The completion document's part list, sorted ascending.
 //
@@ -262,4 +455,18 @@ pub fn owes_abort(u: S3Mpu) -> Bool []
 // necessarily ascending — a parallel uploader finishes them in
 // whatever order the network decided.
 pub fn completion(u: S3Mpu) -> Result<[S3PartInfo], S3Fault> []
-    todo("s3-nv.s3mpu.completion")
+    var out: [S3PartInfo] = []
+    var missing = 0
+    for p in u.parts
+        if p.etag == ""
+            if missing == 0
+                missing = p.number
+        else
+            out = list.concat(out, [S3PartInfo { part_number: p.number, etag: p.etag, size: p.length,
+                                                 last_modified: "" }])
+    if missing > 0
+        Err(S3FaultService(400, S3ErrorDoc { code: S3InvalidPart,
+                                             message: "part ${missing} has not been uploaded",
+                                             resource: "", request_id: "", host_id: "" }))
+    else
+        Ok(out)

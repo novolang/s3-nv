@@ -16,12 +16,6 @@ content types, and
 [calendar-nv](https://novo-lang.org/packages/calendar-nv) for the two
 timestamp formats a signature carries.
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What an S3 object store is
 
 A **bucket** is a named container. A **key** is the name of one object
@@ -113,10 +107,15 @@ fn main() [io, net, time, async]
                 Ok(put) => println("stored, and its etag is ${put.etag}")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: s3-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
+
+## Host only
+
+The package is `host`: a request has to reach a bucket, and the signed
+strings are text and lists that a microcontroller has no use for. It
+makes no device claim and ships no device probe. Seven of its eight
+modules declare no effect at all, so a program that owns its sockets
+can take them and leave `s3client` alone.
 
 ## What the package contains
 
@@ -248,17 +247,16 @@ suite drives a complete exchange over a recorded reply.
 
 ## What is not included
 
-- **A TLS transport.** The standard library's HTTP client routes an
-  `https` URL through one-shot entries that cover `GET` and `POST`,
-  answer no response headers and report a status of 200. An object store
-  needs `PUT`, `HEAD` and `DELETE`, the `ETag` and `Content-Range`
-  headers, and the difference between a 404, a 403 and a 412.
-  `s3client.std_http` therefore refuses an `https` endpoint by name
-  rather than appearing to work against one. What it does serve is every
-  plaintext endpoint: MinIO in a test rig, a gateway inside a private
-  network, and this package's own tests. A transport over
-  [tls-nv](https://novo-lang.org/packages/tls-nv) closes the gap, and a
-  caller may supply one today by implementing `S3Transport`.
+- **A transport that reaches `https`.** `s3client.std_http` refuses an
+  `https` endpoint by name with `S3FaultNoTlsTransport`, and serves
+  every plaintext endpoint: MinIO in a test rig, a gateway inside a
+  private network, and this package's own tests. The standard library's
+  HTTP client documents `https` for every verb in toolchain 0.22, and
+  this release has not been run against it, so the refusal stays until
+  it has. A caller may supply a transport today by implementing
+  `S3Transport`; the shipped one also buffers a `s3_open` reply, because
+  a transport that holds only a copyable struct has nowhere to keep an
+  open connection between `s3_open` and `s3_read`.
 - **Bucket policies, ACLs, CORS, lifecycle, versioning configuration,
   replication, encryption configuration, tagging, inventory, analytics
   and logging.** Each is a separate XML document with its own schema,
@@ -318,50 +316,21 @@ suite drives a complete exchange over a recorded reply.
 novo test tests/s3sig_tests.nv       # 14 tests: the signature and the configuration
 novo test tests/s3flow_tests.nv      # 17 tests: the operations, the listing, the upload
 novo test tests/s3surface_tests.nv   # 9 tests: every public name, spelled as a consumer would
+novo test tests/s3_edge_tests.nv     # 42 tests: the other AWS vectors and every remaining branch
+bash tests/coverage.sh               # measured line coverage of src/, merged across the suites
 ```
 
-The signature the suite asserts is AWS's own, from the Signature Version
-4 worked example: a `GET` of `test.txt` from `examplebucket` in
-`us-east-1` at `20130524T000000Z`, with the canonical request, the
-string to sign and the signature each step produces. Nothing in the
-signing path reads a clock, so that example reproduces exactly. The
-operation tests assert the request each builder produces and the reply
-each reader accepts, over a transport that implements `S3Transport[]`:
-the compiler checks, before any assertion runs, that seven of the eight
-modules reach no socket.
-
-The tests compile today and fail at run, each on the
-`not implemented: s3-nv.<module>.<fn>` panic that is its body. They turn
-green one at a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| The `S3_*` constants in `s3sig`, `s3op` and `s3mpu` | yes (they are constants) |
-| `s3fault.code_of_text`, `.code_text`, `.is_retryable`, `.fault_is_retryable`, `.fix_hint`, `.empty_doc`, `.is_no_such_key`, `.S3Fault.message` | no |
-| `s3cfg.aws`, `.minio`, `.r2`, `.endpoint_of_url`, `.credentials`, `.temporary_credentials`, `.with_addressing`, `.with_region` | no |
-| `s3cfg.host_header`, `.canonical_path`, `.origin`, `.addressing_for`, `.bucket_name_ok`, `.key_ok`, `.is_plaintext` | no |
-| `s3sig.amz_date`, `.amz_day`, `.scope`, `.scope_text`, `.payload_of_body`, `.payload_text`, `.payload_allowed` | no |
-| `s3sig.canonical_uri`, `.canonical_query`, `.canonical_headers`, `.signed_headers`, `.canonical_request`, `.canonical_text` | no |
-| `s3sig.string_to_sign`, `.signing_key`, `.key_day_of`, `.sign`, `.authorize`, `.authorization_headers` | no |
-| `s3sig.presign`, `.presign_expiry`, `.skew_ok`, `.service_time_of` | no |
-| `s3req.request`, `.with_query`, `.with_header`, `.with_body`, `.with_bytes`, `.body_length` | no |
-| `s3req.header_of`, `.request_header_of`, `.range_header`, `.range_from`, `.range_suffix`, `.content_range_of` | no |
-| `s3req.content_type_for`, `.metadata_header`, `.metadata_of`, `.metadata_fits`, `.if_match_header`, `.if_none_match_any` | no |
-| `s3op.get`, `.get_range`, `.get_if_none_match`, `.read_get`, `.head`, `.read_head` | no |
-| `s3op.put`, `.put_streamed`, `.read_put`, `.delete`, `.delete_if_match`, `.read_delete` | no |
-| `s3op.delete_many`, `.read_delete_many`, `.list`, `.read_list`, `.has_more` | no |
-| `s3op.copy`, `.read_copy`, `.copy_source_header`, `.create_bucket`, `.head_bucket` | no |
-| `s3op.etag_is_multipart`, `.etag_part_count`, `.etag_unquoted`, `.body_is_error`, `.fault_of_reply`, `.conditional_writes_supported` | no |
-| `s3xml.is_s3_document`, `.error_doc`, `.list_result`, `.upload_start`, `.upload_done`, `.list_parts`, `.parts_truncated` | no |
-| `s3xml.delete_result`, `.copy_result`, `.write_completion`, `.write_delete`, `.write_bucket_config` | no |
-| `s3mpu.part_size_ok`, `.plan_parts`, `.planned_part_size`, `.needs_multipart`, `.upload`, `.resume` | no |
-| `s3mpu.step`, `.supply_start`, `.supply_part`, `.supply_complete`, `.fail`, `.abort`, `.abort_request` | no |
-| `s3mpu.list_parts_request`, `.list_uploads_request`, `.upload_id_of`, `.state_of`, `.parts_of`, `.progress_of`, `.owes_abort`, `.completion` | no |
-| `s3client.client`, `.std_http`, `.send`, `.open`, and the `S3Transport` implementation for `S3StdHttp` | no |
-| `s3client.get_object`, `.get_range`, `.head_object`, `.put_object`, `.delete_object`, `.copy_object`, `.list_page` | no |
-| `s3client.pump`, `.abort_upload`, `.drain_into`, `.now_civil`, `.credentials_from_env` | no |
+Every signature the suites assert is AWS's own, from the S3 API
+reference at `20130524T000000Z` with the published example credentials:
+the `GET` of `test.txt` with a `Range` header, the `PUT` of
+`test$file.text` with a storage class, the `GET ?lifecycle`, the
+`GET ?max-keys=2&prefix=J` and the presigned `GET` for 86400 seconds.
+Nothing in the signing path reads a clock, so each reproduces exactly.
+The operation tests assert the request each builder produces and the
+reply each reader accepts, over a transport that implements
+`S3Transport[]`: the compiler checks, before any assertion runs, that
+seven of the eight modules reach no socket. One test opens a socket in
+the test process and sends a signed `PUT` through the shipped transport.
 
 ## Licence
 

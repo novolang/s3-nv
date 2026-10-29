@@ -2,9 +2,6 @@
 // worked example, plus the configuration rules the signature depends
 // on.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: s3-nv.<module>.<fn>`.
-//
 // NOT ONE OF THESE TESTS NEEDS A NETWORK, A CLOCK OR A CREDENTIAL.
 // The instant is an argument everywhere in `s3sig`, which is what
 // makes AWS's published example — a fixed timestamp with the exact
@@ -13,10 +10,8 @@
 //
 // THE SIGNATURE HEX BELOW IS AWS'S, from the worked example for a GET
 // of `test.txt` from `examplebucket` in `us-east-1` at
-// `20130524T000000Z`.  It is written out so that the first
-// implementation is measured against the reference rather than against
-// itself; whoever turns it green re-confirms it against AWS's own
-// page before trusting a green run.
+// `20130524T000000Z`.  It is written out so that the signer is measured
+// against the reference rather than against itself.
 
 use std.test
 use std.bytes

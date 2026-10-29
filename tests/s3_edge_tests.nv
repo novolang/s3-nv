@@ -1,0 +1,1319 @@
+// s3_edge_tests.nv — the rest of SigV4's published vectors and the
+// branches the three published suites do not reach.
+//
+// THE VECTORS ARE AWS'S OWN, from "Signature Calculations for the
+// Authorization Header" and "Authenticating Requests: Using Query
+// Parameters" in the S3 API reference: the PUT object, the GET bucket
+// lifecycle, the GET bucket (list objects) and the presigned GET
+// examples, each signed at 20130524T000000Z with the example
+// credentials.  A signer that is right for one of them and wrong for
+// another is the failure these exist to catch.
+
+use std.test
+use std.bytes
+use std.list
+use std.str
+use s3cfg
+use s3fault
+use s3req
+use s3sig
+use s3op
+use s3mpu
+use s3xml
+use s3client
+use std.process
+use civil
+use arith
+use span
+use xmltree
+use hashing
+
+fn example_key() -> S3Credentials
+    s3cfg.credentials("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+
+fn example_at() -> CivilDateTime
+    match civil.date(2013, 5, 24)
+        Ok(d)  => civil.datetime(d, civil.midnight())
+        Err(_) => civil.datetime(civil.date_from_epoch_day(0), civil.midnight())
+
+fn example_cfg() -> S3Config
+    s3cfg.aws("us-east-1", example_key())
+
+fn sig_hex(cfg: S3Config, r: S3Request, p: S3PayloadHash) -> Str
+    match s3sig.authorize(cfg, r, p, example_at())
+        Ok(s)  => s.hex
+        Err(_) => "refused"
+
+fn reply(status: Int, headers: [Str], body: Str) -> S3Reply
+    S3Reply { status: status, headers: headers, body: bytes.from_str(body), streamed: false }
+
+fn refused(r: Result<Str, S3Fault>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+fn is_service(f: S3Fault, status: Int, code: S3ErrorCode) -> Bool
+    match f
+        S3FaultService(s, doc) => s == status and doc.code == code
+        _                      => false
+
+@test
+fn test_aws_put_object_vector() [io]
+    let body = bytes.from_str("Welcome to Amazon S3.")
+    let r = s3req.with_header(
+        s3req.with_header(s3req.with_bytes(s3req.request("PUT", "examplebucket", "test\$file.text"), body),
+                          "Date", "Fri, 24 May 2013 00:00:00 GMT"),
+        "x-amz-storage-class", "REDUCED_REDUNDANCY")
+    test.case("the payload hash of the body is the one AWS prints")
+    match s3sig.payload_of_body(S3BodyBytes(body))
+        S3PayloadSha256(h) => test.assert_eq_str(h, "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072")
+        _                  => test.fail("a body has a hash")
+    test.case("the signature is the one the PUT example prints")
+    test.assert_eq_str(sig_hex(example_cfg(), r, s3sig.payload_of_body(S3BodyBytes(body))),
+                       "98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd")
+
+@test
+fn test_aws_subresource_and_list_vectors() [io]
+    let empty = S3PayloadSha256(s3sig.S3_EMPTY_SHA256)
+    test.case("GET ?lifecycle signs the empty value")
+    test.assert_eq_str(sig_hex(example_cfg(),
+        s3req.with_query(s3req.request("GET", "examplebucket", ""), "lifecycle", ""),
+        empty),
+                       "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543")
+    test.case("GET ?max-keys=2&prefix=J sorts its pairs")
+    let lst = s3req.with_query(s3req.with_query(s3req.request("GET", "examplebucket", ""), "prefix", "J"), "max-keys", "2")
+    test.assert_eq_str(sig_hex(example_cfg(), lst, empty),
+                       "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7")
+
+@test
+fn test_aws_presign_vector() [io]
+    let r = s3req.request("GET", "examplebucket", "test.txt")
+    test.case("the presigned URL carries the signature AWS prints")
+    match s3sig.presign(example_cfg(), r, 86400, example_at())
+        Err(_)  => test.fail("the example is signable")
+        Ok(url) =>
+            test.assert(str.ends_with(url,
+                "&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"))
+            test.assert(str.starts_with(url,
+                "https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host"))
+    test.case("a session token joins the query")
+    let tmp = s3cfg.aws("us-east-1", s3cfg.temporary_credentials("k", "s", "tok"))
+    match s3sig.presign(tmp, r, 60, example_at())
+        Ok(url) => test.assert(str.contains(url, "X-Amz-Security-Token=tok"))
+        Err(_)  => test.fail("a token does not stop a presign")
+    test.case("a zero lifetime and an unaddressable bucket are refused")
+    match s3sig.presign(example_cfg(), r, 0, example_at())
+        Ok(_)  => test.fail("zero seconds")
+        Err(_) => test.assert(true)
+    match s3sig.presign(example_cfg(), s3req.request("GET", "X", "k"), 60, example_at())
+        Ok(_)  => test.fail("a bad bucket")
+        Err(_) => test.assert(true)
+    match s3sig.presign(example_cfg(), s3req.request("GET", "examplebucket", ""), 60, example_at())
+        Ok(url) => test.assert(str.contains(url, "amazonaws.com/?"))
+        Err(_)  => test.fail("a bucket-level URL signs")
+    match s3sig.presign(s3cfg.aws("us-east-1", s3cfg.credentials("k", "s")),
+        s3req.request("GET", "examplebucket", str.repeat("k", 2000)),
+        60,
+        example_at())
+        Ok(_)  => test.fail("a key past 1024 bytes")
+        Err(_) => test.assert(true)
+
+@test
+fn test_sigv4_edges() [io]
+    let empty = S3PayloadSha256(s3sig.S3_EMPTY_SHA256)
+    test.case("the payload texts")
+    test.assert_eq_str(s3sig.payload_text(S3PayloadUnsigned), "UNSIGNED-PAYLOAD")
+    test.assert_eq_str(s3sig.payload_text(S3PayloadStreaming(10)), "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+    match s3sig.payload_of_body(S3BodyStreamed(10, "abc"))
+        S3PayloadSha256(h) => test.assert_eq_str(h, "abc")
+        _                  => test.fail("a hashed stream keeps its hash")
+    match s3sig.payload_of_body(S3BodyStreamedUnhashed(10))
+        S3PayloadUnsigned => test.assert(true)
+        _                 => test.fail("an unhashed stream is unsigned")
+    test.case("an unsigned payload over https and a streaming one over http are allowed")
+    test.assert(s3sig.payload_allowed(S3PayloadUnsigned, example_cfg()) == None)
+    let plain = s3cfg.minio("http", "127.0.0.1", 9000, "us-east-1", example_key())
+    test.assert(s3sig.payload_allowed(S3PayloadStreaming(1), plain) == None)
+    test.case("authorize refuses what payload_allowed refuses")
+    match s3sig.authorize(plain, s3req.request("PUT", "bucket", "k"), S3PayloadUnsigned, example_at())
+        Ok(_)  => test.fail("unsigned over http")
+        Err(_) => test.assert(true)
+    match s3sig.authorize(plain, s3req.request("GET", "", "k"), empty, example_at())
+        Ok(_)  => test.fail("no bucket")
+        Err(_) => test.assert(true)
+    test.case("a bad key is a canonical-request fault")
+    match s3sig.canonical_request(plain, s3req.request("GET", "bucket", str.repeat("k", 2000)), empty, example_at())
+        Ok(_)  => test.fail("key too long")
+        Err(_) => test.assert(true)
+    test.case("a signing key buffer of the wrong size is refused")
+    let s = s3sig.scope(example_at(), "us-east-1", "s3")
+    match s3sig.signing_key("secret", s, bytes.zeros(16))
+        Ok(_)  => test.fail("sixteen bytes cannot hold an HMAC-SHA256")
+        Err(_) => test.assert(true)
+    test.case("internal whitespace runs fold to one space and equal names join with a comma")
+    let hs = [S3Header { name: "X-A", value: "a \t  b" }, S3Header { name: "x-a", value: "c" }]
+    test.assert_eq_str(s3sig.canonical_headers(hs), "x-a:a b,c\n")
+    test.assert_eq_str(s3sig.signed_headers(hs), "x-a")
+    test.case("the query encodes its slash and sorts equal names by value")
+    test.assert_eq_str(s3sig.canonical_query([S3QueryPair { name: "a", value: "2" },
+        S3QueryPair { name: "a", value: "1" },
+        S3QueryPair { name: "a-b", value: "x/y" }]),
+                       "a=1&a=2&a-b=x%2Fy")
+    test.assert_eq_str(s3sig.canonical_uri("/a b!'()*"), "/a%20b%21%27%28%29%2A")
+    test.case("a session token is signed and sent")
+    let tok = s3cfg.aws("us-east-1", s3cfg.temporary_credentials("k", "s", "tok"))
+    match s3sig.authorize(tok, s3req.request("GET", "examplebucket", "k"), empty, example_at())
+        Err(_)  => test.fail("signable")
+        Ok(sig) =>
+            test.assert(str.contains(sig.header, "x-amz-security-token"))
+            let hdrs = s3sig.authorization_headers(tok, sig)
+            test.assert_eq(list.len(hdrs), 4)
+    test.case("without a token there are three headers")
+    match s3sig.authorize(example_cfg(), s3req.request("GET", "examplebucket", "k"), empty, example_at())
+        Err(_)  => test.fail("signable")
+        Ok(sig) => test.assert_eq(list.len(s3sig.authorization_headers(example_cfg(), sig)), 3)
+    test.case("the expiry of a presign")
+    match s3sig.presign_expiry(example_at(), 3600)
+        Ok(t)  => test.assert_eq_str(s3sig.amz_date(t), "20130524T010000Z")
+        Err(_) => test.fail("an hour is inside the ceiling")
+    match s3sig.presign_expiry(example_at(), 0)
+        Ok(_)  => test.fail("zero")
+        Err(_) => test.assert(true)
+    test.case("a date at the end of the calendar has no expiry")
+    match civil.date(999999999, 12, 31)
+        Err(_)  => test.fail("a far date")
+        Ok(far) =>
+            match s3sig.presign_expiry(civil.datetime(far, civil.midnight()), 86400)
+                Ok(_)  => test.fail("past the range of years")
+                Err(_) => test.assert(true)
+    test.case("the service clock comes out of the Date header")
+    match s3sig.service_time_of(["Date: Fri, 24 May 2013 00:00:00 GMT"])
+        Some(t) => test.assert_eq_str(s3sig.amz_date(t), "20130524T000000Z")
+        None    => test.fail("an RFC 1123 date parses")
+    test.assert(s3sig.service_time_of(["Date: yesterday"]) == None)
+    test.assert(s3sig.service_time_of([]) == None)
+    test.case("fifteen minutes is the edge, a negative gap counts too")
+    let later = match arith.add_delta(example_at(), span.minutes(15))
+        Ok(t)  => t
+        Err(_) => example_at()
+    test.assert(s3sig.skew_ok(example_at(), later))
+    test.assert(s3sig.skew_ok(later, example_at()))
+    let much = match arith.add_delta(example_at(), span.minutes(16))
+        Ok(t)  => t
+        Err(_) => example_at()
+    test.assert(not s3sig.skew_ok(much, example_at()))
+    test.assert(not s3sig.skew_ok(example_at(), much))
+
+// ── Configuration ────────────────────────────────────────────────────
+
+@test
+fn test_the_presets_name_their_endpoints() [io]
+    test.case("AWS outside us-east-1 carries the region in the host")
+    let eu = s3cfg.aws("eu-north-1", example_key())
+    test.assert_eq_str(eu.endpoint.host, "s3.eu-north-1.amazonaws.com")
+    test.assert_eq_str(eu.service, "s3")
+    test.case("changing the region of an AWS configuration changes its host")
+    test.assert_eq_str(s3cfg.with_region(eu, "us-east-1").endpoint.host, "s3.amazonaws.com")
+    test.assert_eq_str(s3cfg.with_region(example_cfg(), "eu-west-1").endpoint.host, "s3.eu-west-1.amazonaws.com")
+    test.assert_eq_str(s3cfg.with_region(example_cfg(), "eu-west-1").region, "eu-west-1")
+    test.case("and of any other leaves the host alone")
+    let m = s3cfg.minio("HTTP", "Minio.Local", 9000, "us-east-1", example_key())
+    test.assert_eq_str(m.endpoint.scheme, "http")
+    test.assert_eq_str(m.endpoint.host, "minio.local")
+    test.assert_eq_str(s3cfg.with_region(m, "eu-west-1").endpoint.host, "minio.local")
+    test.case("R2 signs against the region auto")
+    let r2 = s3cfg.r2("acct", example_key())
+    test.assert_eq_str(r2.region, "auto")
+    test.assert_eq_str(r2.endpoint.host, "acct.r2.cloudflarestorage.com")
+    test.assert(r2.endpoint.addressing == S3PathStyle)
+    test.assert(not s3cfg.is_plaintext(r2))
+    test.assert(s3cfg.is_plaintext(m))
+
+@test
+fn test_an_endpoint_comes_out_of_a_url() [io]
+    test.case("host, scheme and port")
+    match s3cfg.endpoint_of_url("HTTP://Store.Example:9000/ignored", S3PathStyle)
+        Ok(e)  =>
+            test.assert_eq_str(e.scheme, "http")
+            test.assert_eq_str(e.host, "store.example")
+            test.assert_eq(e.port, 9000)
+        Err(_) => test.fail("a URL")
+    match s3cfg.endpoint_of_url("https://store.example", S3VirtualHost)
+        Ok(e)  => test.assert_eq(e.port, 443)
+        Err(_) => test.fail("a URL")
+    test.case("a scheme without a transport, no scheme and no host are refused")
+    match s3cfg.endpoint_of_url("ftp://store.example", S3PathStyle)
+        Ok(_)  => test.fail("ftp")
+        Err(_) => test.assert(true)
+    match s3cfg.endpoint_of_url("store.example", S3PathStyle)
+        Ok(_)  => test.fail("no scheme")
+        Err(_) => test.assert(true)
+    match s3cfg.endpoint_of_url("http://", S3PathStyle)
+        Ok(_)  => test.fail("no host")
+        Err(_) => test.assert(true)
+    match s3cfg.endpoint_of_url("http:///x", S3PathStyle)
+        Ok(_)  => test.fail("an empty host")
+        Err(_) => test.assert(true)
+    match s3cfg.endpoint_of_url("http://:80/x", S3PathStyle)
+        Ok(_)  => test.fail("a port without a host")
+        Err(_) => test.assert(true)
+    match s3cfg.endpoint_of_url("mailto:a@b", S3PathStyle)
+        Ok(_)  => test.fail("no authority")
+        Err(_) => test.assert(true)
+
+@test
+fn test_host_path_and_origin_follow_the_addressing_style() [io]
+    let virt = example_cfg()
+    let flat = s3cfg.with_addressing(virt, S3PathStyle)
+    let minio = s3cfg.minio("http", "127.0.0.1", 9000, "us-east-1", example_key())
+    let std80 = s3cfg.minio("http", "127.0.0.1", 80, "us-east-1", example_key())
+    let zero = s3cfg.minio("https", "h", 0, "us-east-1", example_key())
+    test.case("virtual-host puts the bucket in the host")
+    test.assert(s3cfg.host_header(virt, "examplebucket") == Ok("examplebucket.s3.amazonaws.com"))
+    test.assert(s3cfg.origin(virt, "examplebucket") == Ok("https://examplebucket.s3.amazonaws.com"))
+    test.case("path-style does not, and a non-default port is spelled")
+    test.assert(s3cfg.host_header(flat, "examplebucket") == Ok("s3.amazonaws.com"))
+    test.assert(s3cfg.host_header(minio, "b") == Ok("127.0.0.1:9000"))
+    test.assert(s3cfg.origin(minio, "b") == Ok("http://127.0.0.1:9000"))
+    test.assert(s3cfg.host_header(std80, "b") == Ok("127.0.0.1"))
+    test.assert(s3cfg.host_header(zero, "b") == Ok("h"))
+    test.case("a bucket-level path")
+    test.assert(s3cfg.canonical_path(virt, "examplebucket", "") == Ok("/"))
+    test.assert(s3cfg.canonical_path(minio, "b", "") == Ok("/b"))
+    test.assert(s3cfg.canonical_path(minio, "b", "a/b c") == Ok("/b/a/b c"))
+    test.case("an unusable bucket or key is refused")
+    test.assert(refused(s3cfg.host_header(virt, "X")))
+    test.assert(refused(s3cfg.host_header(minio, "")))
+    test.assert(refused(s3cfg.host_header(minio, "a/b")))
+    test.assert(refused(s3cfg.canonical_path(virt, "X", "k")))
+    test.assert(refused(s3cfg.canonical_path(minio, "b", str.repeat("k", 1025))))
+    test.assert(refused(s3cfg.origin(virt, "X")))
+    test.case("http never forces path style")
+    let plain_virt = s3cfg.with_addressing(minio, S3VirtualHost)
+    test.assert(s3cfg.addressing_for(plain_virt, "a.b.c") == S3VirtualHost)
+    test.assert(s3cfg.addressing_for(flat, "a.b.c") == S3PathStyle)
+
+@test
+fn test_bucket_names_and_keys() [io]
+    test.assert(not s3cfg.bucket_name_ok(str.repeat("a", 64)))
+    test.assert(s3cfg.bucket_name_ok(str.repeat("a", 63)))
+    test.assert(not s3cfg.bucket_name_ok("a..b"))
+    test.assert(not s3cfg.bucket_name_ok("-abc"))
+    test.assert(not s3cfg.bucket_name_ok("abc-"))
+    test.assert(not s3cfg.bucket_name_ok("ab_c"))
+    test.assert(not s3cfg.bucket_name_ok("1.2.3.4"))
+    test.assert(s3cfg.bucket_name_ok("1.2.3.x"))
+    test.assert(s3cfg.bucket_name_ok("1.2.3"))
+    test.assert(s3cfg.bucket_name_ok("a-b.c"))
+    test.assert(not s3cfg.key_ok(""))
+    test.assert(s3cfg.key_ok("a"))
+    test.assert(s3cfg.key_ok(str.repeat("k", 1024)))
+    test.assert(not s3cfg.key_ok(str.repeat("k", 1025)))
+
+// ── Faults ───────────────────────────────────────────────────────────
+
+fn every_code() -> [S3ErrorCode]
+    [S3NoSuchBucket, S3NoSuchKey, S3NoSuchUpload, S3AccessDenied, S3SignatureDoesNotMatch,
+     S3InvalidAccessKeyId, S3RequestTimeTooSkewed, S3EntityTooSmall, S3EntityTooLarge,
+     S3InvalidPart, S3InvalidPartOrder, S3PreconditionFailed, S3SlowDown, S3InternalError,
+     S3BucketAlreadyOwnedByYou, S3InvalidBucketName, S3InvalidRange, S3MalformedXml]
+
+fn doc_of(code: S3ErrorCode) -> S3ErrorDoc
+    S3ErrorDoc { code: code, message: "m", resource: "/r", request_id: "q", host_id: "h" }
+
+@test
+fn test_every_code_round_trips_through_its_text() [io]
+    for c in every_code()
+        test.assert(s3fault.code_of_text(s3fault.code_text(c)) == c)
+    test.assert_eq_str(s3fault.code_text(S3OtherCode("X")), "X")
+    test.assert_eq_str(s3fault.code_text(S3MalformedXml), "MalformedXML")
+
+@test
+fn test_retry_follows_the_code_and_the_transport() [io]
+    test.case("only three codes are retried")
+    var n = 0
+    for c in every_code()
+        if s3fault.is_retryable(c)
+            n = n + 1
+    test.assert_eq(n, 3)
+    test.assert(not s3fault.is_retryable(S3OtherCode("X")))
+    test.case("a fault is retried by its code, by a 5xx without one, by the transport when idempotent")
+    test.assert(s3fault.fault_is_retryable(S3FaultService(503, doc_of(S3SlowDown)), false))
+    test.assert(not s3fault.fault_is_retryable(S3FaultService(403, doc_of(S3AccessDenied)), true))
+    test.assert(s3fault.fault_is_retryable(S3FaultService(500, doc_of(S3OtherCode(""))), false))
+    test.assert(not s3fault.fault_is_retryable(S3FaultService(501, doc_of(S3OtherCode(""))), false))
+    test.assert(not s3fault.fault_is_retryable(S3FaultService(404, doc_of(S3OtherCode(""))), false))
+    test.assert(s3fault.fault_is_retryable(S3FaultTransport("reset"), true))
+    test.assert(not s3fault.fault_is_retryable(S3FaultTransport("reset"), false))
+    test.assert(s3fault.fault_is_retryable(S3FaultTruncatedBody(10, 5), true))
+    test.assert(not s3fault.fault_is_retryable(S3FaultBadXml("x"), true))
+
+@test
+fn test_a_hint_names_the_repair_for_the_codes_that_have_one() [io]
+    var with_hint = 0
+    for c in every_code()
+        if s3fault.fix_hint(doc_of(c)) != ""
+            with_hint = with_hint + 1
+    test.assert_eq(with_hint, 8)
+    test.assert(str.contains(s3fault.fix_hint(doc_of(S3RequestTimeTooSkewed)), "NTP"))
+    test.assert(str.contains(s3fault.fix_hint(doc_of(S3SignatureDoesNotMatch)), "addressing"))
+    test.assert_eq_str(s3fault.fix_hint(s3fault.empty_doc(500)), "")
+
+@test
+fn test_a_missing_key_is_the_code_or_an_empty_404() [io]
+    test.assert(s3fault.is_no_such_key(S3FaultService(404, s3fault.empty_doc(404))))
+    test.assert(not s3fault.is_no_such_key(S3FaultService(403, s3fault.empty_doc(403))))
+    test.assert(not s3fault.is_no_such_key(S3FaultService(404, doc_of(S3OtherCode("Odd")))))
+    test.assert(not s3fault.is_no_such_key(S3FaultTransport("x")))
+    test.assert(s3fault.is_no_such_key(S3FaultService(200, doc_of(S3NoSuchKey))))
+
+@test
+fn test_every_fault_says_what_happened() [io]
+    let faults = [S3FaultService(403, doc_of(S3AccessDenied)), S3FaultTransport("t"),
+                  S3FaultBadEndpoint("e"), S3FaultUnsignedOverPlaintext("u"),
+                  S3FaultPresignTooLong(9), S3FaultPartTooSmall(2, 3), S3FaultPartOutOfOrder(2, 3),
+                  S3FaultTruncatedBody(5, 4), S3FaultBadXml("x"), S3FaultNoTlsTransport("n"),
+                  S3FaultBadKey("k")]
+    for f in faults
+        test.assert(str.starts_with(f.message(), "s3: "))
+    test.assert_eq_str(faults[0].message(), "s3: the service answered 403 AccessDenied: m")
+    test.assert(str.contains(faults[4].message(), "9 seconds"))
+    test.assert(str.contains(faults[7].message(), "4 bytes"))
+    test.assert(str.contains(faults[5].message(), "part 2 is 3 bytes"))
+
+// ── Requests ─────────────────────────────────────────────────────────
+
+@test
+fn test_header_lookup_is_case_blind_and_ignores_lines_without_a_colon() [io]
+    test.assert(s3req.header_of(["HTTP/1.1 200 OK", "Etag:  \"x\" "], "ETAG") == Some("\"x\""))
+    test.assert(s3req.header_of(["A: 1"], "b") == None)
+    test.assert(s3req.header_of([], "b") == None)
+    test.assert(s3req.header_of(["A: 1", "a: 2"], "a") == Some("1"))
+    let r = s3req.with_header(s3req.request("GET", "b", "k"), "Range", "bytes=0-1")
+    test.assert(s3req.request_header_of(r, "range") == Some("bytes=0-1"))
+    test.assert(s3req.request_header_of(r, "x") == None)
+    let two = s3req.with_header(r, "RANGE", "other")
+    test.assert(s3req.request_header_of(two, "range") == Some("bytes=0-1"))
+
+@test
+fn test_a_content_range_that_is_not_three_numbers_is_none() [io]
+    test.assert(s3req.content_range_of([]) == None)
+    test.assert(s3req.content_range_of(["Content-Range: items 0-1/2"]) == None)
+    test.assert(s3req.content_range_of(["Content-Range: bytes 0-1"]) == None)
+    test.assert(s3req.content_range_of(["Content-Range: bytes 0/1/2"]) == None)
+    test.assert(s3req.content_range_of(["Content-Range: bytes 0-1/*"]) == None)
+    test.assert(s3req.content_range_of(["Content-Range: bytes a-1/2"]) == None)
+    test.assert(s3req.content_range_of(["Content-Range: bytes 0-b/2"]) == None)
+    test.assert(s3req.content_range_of(["Content-Range: bytes */2"]) == None)
+
+@test
+fn test_metadata_and_conditions() [io]
+    let meta = s3req.metadata_of(["ETag: x", "X-Amz-Meta-Author: ada", "x-amz-meta-k: v"])
+    test.assert_eq(list.len(meta), 2)
+    test.assert_eq_str(meta[0].name, "author")
+    test.assert_eq_str(meta[1].value, "v")
+    test.assert(s3req.metadata_fits([]))
+    test.assert(not s3req.metadata_fits([s3req.metadata_header("k", str.repeat("v", 2100))]))
+    test.assert_eq_str(s3req.if_match_header("\"e\"").name, "If-Match")
+    test.assert_eq_str(s3req.if_none_match_any().value, "*")
+    test.assert_eq(s3req.body_length(S3BodyNone), 0)
+    test.assert_eq(s3req.body_length(S3BodyStreamed(7, "h")), 7)
+    test.assert_eq(s3req.body_length(S3BodyStreamedUnhashed(8)), 8)
+    test.assert_eq(s3req.body_length(S3BodyBytes(bytes.zeros(3))), 3)
+
+// ── XML ──────────────────────────────────────────────────────────────
+
+fn ns() -> Str
+    "http://s3.amazonaws.com/doc/2006-03-01/"
+
+fn doc(root: Str, inner: Str) -> Bytes
+    bytes.from_str("<?xml version=\"1.0\"?><" + root + " xmlns=\"" + ns() + "\">" + inner + "</" + root + ">")
+
+fn list_doc(inner: Str) -> Bytes
+    doc("ListBucketResult", inner)
+
+fn truncated_flag(b: Bool) -> Str
+    if b
+        "true"
+    else
+        "false"
+
+@test
+fn test_a_url_encoded_listing_is_decoded() [io]
+    let body = list_doc("<Name>b</Name><Prefix>a+b/</Prefix><KeyCount>2</KeyCount><Delimiter>/</Delimiter><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated><NextContinuationToken>tok</NextContinuationToken><Contents><Key>a+b/c%2Bd.txt</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;e1&quot;</ETag><Size>5</Size><StorageClass>STANDARD</StorageClass></Contents><CommonPrefixes><Prefix>a+b/sub/</Prefix></CommonPrefixes>")
+    match s3xml.list_result(body)
+        Err(_) => test.fail("a listing")
+        Ok(p)  =>
+            test.assert_eq_str(p.prefix, "a b/")
+            test.assert_eq_str(p.delimiter, "/")
+            test.assert_eq(list.len(p.entries), 1)
+            test.assert_eq_str(p.entries[0].key, "a b/c+d.txt")
+            test.assert_eq_str(p.entries[0].etag, "\"e1\"")
+            test.assert_eq(p.entries[0].size, 5)
+            test.assert_eq_str(p.entries[0].storage_class, "STANDARD")
+            test.assert_eq_str(p.prefixes[0], "a b/sub/")
+            test.assert(p.is_truncated)
+            test.assert(p.encoding)
+            test.assert_eq(p.key_count, 2)
+            test.assert(p.next_continuation == Some("tok"))
+
+@test
+fn test_a_plain_listing_counts_its_own_keys_when_the_reply_does_not() [io]
+    match s3xml.list_result(list_doc("<IsTruncated>false</IsTruncated><Contents><Key>k+1</Key><Size>x</Size></Contents>"))
+        Err(_) => test.fail("a listing")
+        Ok(p)  =>
+            test.assert_eq_str(p.entries[0].key, "k+1")
+            test.assert_eq(p.entries[0].size, 0)
+            test.assert_eq(p.key_count, 1)
+            test.assert(not p.encoding)
+            test.assert(p.next_continuation == None)
+
+@test
+fn test_a_listing_that_disagrees_with_itself_is_refused() [io]
+    test.assert(is_bad_xml(s3xml.list_result(list_doc("<IsTruncated>true</IsTruncated>"))))
+    test.assert(is_bad_xml(s3xml.list_result(list_doc("<IsTruncated>false</IsTruncated><NextContinuationToken>t</NextContinuationToken>"))))
+    test.assert(is_bad_xml(s3xml.list_result(doc("DeleteResult", ""))))
+    test.assert(is_bad_xml(s3xml.list_result(bytes.from_str("<ListBucketResult></ListBucketResult>"))))
+    test.assert(is_bad_xml(s3xml.list_result(bytes.from_str("<html><body>portal</body></html>"))))
+    test.assert(is_bad_xml(s3xml.list_result(bytes.zeros(0))))
+
+fn is_bad_xml(r: Result<S3ListPage, S3Fault>) -> Bool
+    match r
+        Err(S3FaultBadXml(_)) => true
+        _                     => false
+
+fn bad_xml_of<T>(r: Result<T, S3Fault>) -> Bool
+    match r
+        Err(S3FaultBadXml(_)) => true
+        _                     => false
+
+@test
+fn test_the_namespace_is_matched() [io]
+    test.assert(s3xml.is_s3_document(xmltree.build("<ListBucketResult xmlns=\"" + ns() + "\"></ListBucketResult>")))
+    test.assert(s3xml.is_s3_document(xmltree.build("<Error><Code>X</Code></Error>")))
+    test.assert(not s3xml.is_s3_document(xmltree.build("<ListBucketResult></ListBucketResult>")))
+    test.assert(not s3xml.is_s3_document(xmltree.build("<ListBucketResult xmlns=\"urn:other\"></ListBucketResult>")))
+    test.assert(not s3xml.is_s3_document(xmltree.build("<html></html>")))
+    test.assert(not s3xml.is_s3_document(xmltree.build("")))
+
+@test
+fn test_an_error_document_never_fails_to_parse() [io]
+    let e = s3xml.error_doc(bytes.from_str("<Error><Code>NoSuchKey</Code><Message>gone</Message><Resource>/b/k</Resource><RequestId>r1</RequestId><HostId>h1</HostId></Error>"))
+    test.assert(e.code == S3NoSuchKey)
+    test.assert_eq_str(e.message, "gone")
+    test.assert_eq_str(e.resource, "/b/k")
+    test.assert_eq_str(e.request_id, "r1")
+    test.assert_eq_str(e.host_id, "h1")
+    let page = s3xml.error_doc(bytes.from_str("  <html>\nBad gateway\n</html>"))
+    test.assert(page.code == S3OtherCode(""))
+    test.assert_eq_str(page.message, "<html>")
+    test.assert_eq_str(s3xml.error_doc(bytes.zeros(0)).message, "")
+
+@test
+fn test_multipart_documents_are_read() [io]
+    match s3xml.upload_start(doc("InitiateMultipartUploadResult", "<Bucket>b</Bucket><Key>k</Key><UploadId>u1</UploadId>"))
+        Ok(s)  =>
+            test.assert_eq_str(s.upload_id, "u1")
+            test.assert_eq_str(s.bucket, "b")
+            test.assert_eq_str(s.key, "k")
+        Err(_) => test.fail("a start")
+    test.assert(bad_xml_of(s3xml.upload_start(doc("InitiateMultipartUploadResult", "<Bucket>b</Bucket>"))))
+    match s3xml.upload_done(doc("CompleteMultipartUploadResult",
+        "<Location>l</Location><Bucket>b</Bucket><Key>k</Key><ETag>&quot;e-2&quot;</ETag>"))
+        Ok(d)  =>
+            test.assert_eq_str(d.etag, "\"e-2\"")
+            test.assert_eq_str(d.location, "l")
+        Err(_) => test.fail("a completion")
+    test.case("a failure inside a 200 reaches the caller as the service's own fault")
+    match s3xml.upload_done(bytes.from_str("<Error><Code>InternalError</Code><Message>m</Message></Error>"))
+        Err(f) => test.assert(is_service(f, 200, S3InternalError))
+        Ok(_)  => test.fail("an Error document is a failure")
+    test.assert(bad_xml_of(s3xml.upload_done(doc("ListBucketResult", ""))))
+    let parts = doc("ListPartsResult",
+        "<IsTruncated>true</IsTruncated><Part><PartNumber>1</PartNumber><ETag>&quot;a&quot;</ETag><Size>5</Size><LastModified>t</LastModified></Part><Part><PartNumber>2</PartNumber><ETag>&quot;b&quot;</ETag><Size>6</Size></Part>")
+    match s3xml.list_parts(parts)
+        Ok(ps) =>
+            test.assert_eq(list.len(ps), 2)
+            test.assert_eq(ps[1].part_number, 2)
+            test.assert_eq(ps[0].size, 5)
+            test.assert_eq_str(ps[0].last_modified, "t")
+        Err(_) => test.fail("parts")
+    test.assert(s3xml.parts_truncated(parts) == Ok(true))
+    test.assert(s3xml.parts_truncated(doc("ListPartsResult", "")) == Ok(false))
+    test.assert(bad_xml_of(s3xml.list_parts(doc("ListBucketResult", ""))))
+    test.assert(bad_xml_of(s3xml.parts_truncated(doc("ListBucketResult", ""))))
+
+@test
+fn test_batch_delete_and_copy_documents() [io]
+    match s3xml.delete_result(doc("DeleteResult",
+        "<Deleted><Key>a</Key></Deleted><Error><Key>b</Key><Code>AccessDenied</Code><Message>no</Message></Error><Other/>"))
+        Ok(os) =>
+            test.assert_eq(list.len(os), 2)
+            test.assert_eq_str(os[0].key, "a")
+            test.assert_eq_str(os[0].code, "")
+            test.assert_eq_str(os[1].code, "AccessDenied")
+            test.assert_eq_str(os[1].message, "no")
+        Err(_) => test.fail("a result")
+    test.assert(bad_xml_of(s3xml.delete_result(doc("ListBucketResult", ""))))
+    test.assert(s3xml.copy_result(doc("CopyObjectResult", "<ETag>&quot;c&quot;</ETag>")) == Ok("\"c\""))
+    test.assert(bad_xml_of(s3xml.copy_result(doc("ListBucketResult", ""))))
+    match s3xml.copy_result(bytes.from_str("<Error><Code>SlowDown</Code></Error>"))
+        Err(f) => test.assert(is_service(f, 200, S3SlowDown))
+        Ok(_)  => test.fail("an Error document is a failure")
+
+@test
+fn test_the_request_documents_are_written_and_escaped() [io]
+    let parts = [S3PartInfo { part_number: 1, etag: "\"a&b\"", size: 5, last_modified: "" },
+                 S3PartInfo { part_number: 2, etag: "\"c\"", size: 5, last_modified: "" }]
+    test.assert_eq_str(bytes.to_str(s3xml.write_completion(parts)),
+                       "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"a&amp;b\"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>\"c\"</ETag></Part></CompleteMultipartUpload>")
+    test.assert_eq_str(bytes.to_str(s3xml.write_delete(["a<b"], true)),
+                       "<Delete><Quiet>true</Quiet><Object><Key>a&lt;b</Key></Object></Delete>")
+    test.assert_eq_str(bytes.to_str(s3xml.write_delete(["k"], false)),
+                       "<Delete><Object><Key>k</Key></Object></Delete>")
+    test.case("us-east-1 is the one region the document must not name")
+    test.assert_eq(bytes.len(s3xml.write_bucket_config("us-east-1")), 0)
+    test.assert_eq(bytes.len(s3xml.write_bucket_config("")), 0)
+    test.assert(str.contains(bytes.to_str(s3xml.write_bucket_config("eu-west-1")),
+        "<LocationConstraint>eu-west-1</LocationConstraint>"))
+
+// ── Operations ───────────────────────────────────────────────────────
+
+fn query_of(r: S3Request, name: Str) -> Str
+    var found = "<absent>"
+    for q in r.query
+        if q.name == name
+            found = q.value
+    found
+
+fn error_reply(status: Int, code: Str) -> S3Reply
+    reply(status, [], "<Error><Code>" + code + "</Code><Message>m</Message></Error>")
+
+@test
+fn test_the_builders_make_the_requests_the_operations_are() [io]
+    test.assert_eq_str(s3op.get_range("b", "k", 2, 5).headers[0].value, "bytes=2-5")
+    test.assert_eq_str(s3op.get_if_none_match("b", "k", "\"e\"").headers[0].name, "If-None-Match")
+    test.assert_eq_str(s3op.head("b", "k").method, "HEAD")
+    test.assert_eq_str(s3op.head_bucket("b").key, "")
+    test.assert_eq_str(s3op.delete("b", "k").method, "DELETE")
+    test.assert_eq_str(s3op.delete_if_match("b", "k", "\"e\"").headers[0].value, "\"e\"")
+    test.case("a put names its content type from the key, with or without a hash")
+    let p = s3op.put("b", "page.html", bytes.from_str("x"))
+    test.assert_eq_str(p.headers[0].value, "text/html")
+    test.assert_eq(s3req.body_length(p.body), 1)
+    let ps = s3op.put_streamed("b", "blob", 10, "abc")
+    test.assert_eq_str(ps.headers[0].value, "application/octet-stream")
+    test.assert_eq(s3req.body_length(ps.body), 10)
+    test.case("a copy encodes its source, and the directive follows the flag")
+    test.assert_eq_str(s3op.copy_source_header("b", "a b/c"), "/b/a%20b/c")
+    let c = s3op.copy("b", "k", "b2", "k2", true)
+    test.assert_eq_str(c.bucket, "b2")
+    test.assert_eq_str(c.headers[1].value, "REPLACE")
+    test.assert_eq_str(s3op.copy("b", "k", "b2", "k2", false).headers[1].value, "COPY")
+    test.case("a listing asks for url encoding and clamps its page size")
+    let l = s3op.list("b", "p/", "/", 5000, Some("tok"))
+    test.assert_eq_str(query_of(l, "list-type"), "2")
+    test.assert_eq_str(query_of(l, "encoding-type"), "url")
+    test.assert_eq_str(query_of(l, "prefix"), "p/")
+    test.assert_eq_str(query_of(l, "delimiter"), "/")
+    test.assert_eq_str(query_of(l, "max-keys"), "1000")
+    test.assert_eq_str(query_of(l, "continuation-token"), "tok")
+    let bare = s3op.list("b", "", "", 0, None)
+    test.assert_eq_str(query_of(bare, "prefix"), "<absent>")
+    test.assert_eq_str(query_of(bare, "delimiter"), "<absent>")
+    test.assert_eq_str(query_of(bare, "max-keys"), "1")
+    test.assert_eq_str(query_of(bare, "continuation-token"), "<absent>")
+    test.assert_eq_str(query_of(s3op.list("b", "", "", 7, None), "max-keys"), "7")
+
+@test
+fn test_create_bucket_and_batch_delete_requests() [io]
+    match s3op.create_bucket("bucket", "us-east-1")
+        Ok(r)  =>
+            test.assert_eq(s3req.body_length(r.body), 0)
+            test.assert_eq(list.len(r.headers), 0)
+        Err(_) => test.fail("a bucket")
+    match s3op.create_bucket("bucket", "eu-west-1")
+        Ok(r)  =>
+            test.assert(s3req.body_length(r.body) > 0)
+            test.assert_eq_str(r.headers[0].value, "application/xml")
+        Err(_) => test.fail("a bucket")
+    test.assert(refused_req(s3op.create_bucket("B", "eu-west-1")))
+    match s3op.delete_many("b", ["a", "b"], false)
+        Err(_) => test.fail("two keys")
+        Ok(r)  =>
+            test.assert_eq_str(r.method, "POST")
+            test.assert_eq_str(query_of(r, "delete"), "")
+            test.assert_eq(list.len(r.headers), 2)
+            test.assert_eq_str(r.headers[0].name, "Content-MD5")
+    test.case("Content-MD5 is the base64 of the MD5 of the document")
+    match s3op.delete_many("b", ["a"], false)
+        Err(_) => test.fail("a key")
+        Ok(r)  =>
+            match r.body
+                S3BodyBytes(d) => test.assert(bytes.to_base64(hashing.md5(d)) == r.headers[0].value)
+                _              => test.fail("the document is the body")
+    test.case("none, too many, or an unusable key are refused")
+    test.assert(refused_req(s3op.delete_many("b", [], false)))
+    test.assert(refused_req(s3op.delete_many("b", list.map(list.range(0, 1001), i => "k"), false)))
+    test.assert(refused_req(s3op.delete_many("b", ["ok", ""], false)))
+
+fn refused_req(r: Result<S3Request, S3Fault>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+@test
+fn test_a_get_reply_is_read_with_its_headers() [io]
+    let hs = ["ETag: \"e\"", "Content-Type: text/plain", "Content-Length: 3", "Last-Modified: x",
+              "x-amz-meta-a: b", "x-amz-version-id: v1", "Content-Range: bytes 0-2/10"]
+    match s3op.read_get(reply(206, hs, "abc"), false)
+        Err(_) => test.fail("a ranged reply")
+        Ok(o)  =>
+            test.assert_eq_str(o.etag, "\"e\"")
+            test.assert_eq_str(o.content_type, "text/plain")
+            test.assert_eq(o.content_length, 3)
+            test.assert_eq_str(o.last_modified, "x")
+            test.assert_eq_str(o.version_id, "v1")
+            test.assert_eq(list.len(o.metadata), 1)
+            test.assert(o.content_range == Some((0, 2, 10)))
+            test.assert_eq_str(bytes.to_str(o.body), "abc")
+    test.case("no Content-Length means the body is the length")
+    match s3op.read_get(reply(200, [], "abcd"), false)
+        Ok(o)  => test.assert_eq(o.content_length, 4)
+        Err(_) => test.fail("a reply")
+    test.case("a streamed body is left on the wire")
+    match s3op.read_get(reply(200, ["Content-Length: 9"], ""), true)
+        Ok(o)  =>
+            test.assert_eq(bytes.len(o.body), 0)
+            test.assert_eq(o.content_length, 9)
+        Err(_) => test.fail("a streamed reply")
+    test.case("a short body is a truncation and never an empty read")
+    match s3op.read_get(reply(200, ["Content-Length: 9"], "abc"), false)
+        Err(S3FaultTruncatedBody(9, 3)) => test.assert(true)
+        _                               => test.fail("a truncation")
+    test.case("a failure carries the service's code, a 304 carries none")
+    match s3op.read_get(error_reply(404, "NoSuchKey"), false)
+        Err(f) => test.assert(s3fault.is_no_such_key(f))
+        Ok(_)  => test.fail("a 404")
+    match s3op.read_get(reply(304, [], ""), false)
+        Err(f) => test.assert(is_service(f, 304, S3OtherCode("")))
+        Ok(_)  => test.fail("a 304 is not an object")
+
+@test
+fn test_head_put_delete_and_copy_replies() [io]
+    match s3op.read_head(reply(200, ["ETag: \"e\"",
+        "Content-Length: 12",
+        "x-amz-storage-class: GLACIER",
+        "x-amz-version-id: v",
+        "Content-Type: a/b",
+        "Last-Modified: t",
+        "x-amz-meta-k: v"],
+    ""))
+        Ok(h)  =>
+            test.assert_eq(h.content_length, 12)
+            test.assert_eq_str(h.storage_class, "GLACIER")
+            test.assert_eq_str(h.etag, "\"e\"")
+            test.assert_eq_str(h.version_id, "v")
+            test.assert_eq_str(h.content_type, "a/b")
+            test.assert_eq_str(h.last_modified, "t")
+            test.assert_eq(list.len(h.metadata), 1)
+        Err(_) => test.fail("a head")
+    test.case("a HEAD that fails has no document and is told from the status")
+    match s3op.read_head(reply(404, [], ""))
+        Err(f) => test.assert(s3fault.is_no_such_key(f))
+        Ok(_)  => test.fail("a 404")
+    match s3op.read_head(reply(403, [], ""))
+        Err(f) => test.assert(not s3fault.is_no_such_key(f))
+        Ok(_)  => test.fail("a 403")
+    match s3op.read_put(reply(200, ["ETag: \"p\"", "x-amz-version-id: v2"], ""))
+        Ok(p)  =>
+            test.assert_eq_str(p.etag, "\"p\"")
+            test.assert_eq_str(p.version_id, "v2")
+        Err(_) => test.fail("a put")
+    match s3op.read_put(error_reply(412, "PreconditionFailed"))
+        Err(f) => test.assert(is_service(f, 412, S3PreconditionFailed))
+        Ok(_)  => test.fail("a 412")
+    test.assert(s3op.read_delete(reply(204, [], "")) == None)
+    match s3op.read_delete(error_reply(403, "AccessDenied"))
+        Some(f) => test.assert(is_service(f, 403, S3AccessDenied))
+        None    => test.fail("a 403")
+    test.case("a copy fails inside its 200 and succeeds with an ETag")
+    test.assert(s3op.read_copy(reply(200, [], bytes.to_str(doc("CopyObjectResult", "<ETag>&quot;c&quot;</ETag>")))) == Ok("\"c\""))
+    match s3op.read_copy(reply(200, [], "<Error><Code>InternalError</Code></Error>"))
+        Err(f) => test.assert(is_service(f, 200, S3InternalError))
+        Ok(_)  => test.fail("an Error inside a 200")
+    match s3op.read_copy(error_reply(404, "NoSuchBucket"))
+        Err(f) => test.assert(is_service(f, 404, S3NoSuchBucket))
+        Ok(_)  => test.fail("a 404")
+
+@test
+fn test_list_and_batch_delete_replies() [io]
+    match s3op.read_list(reply(200, [], bytes.to_str(list_doc("<IsTruncated>false</IsTruncated>"))))
+        Ok(p)  => test.assert(not s3op.has_more(p))
+        Err(_) => test.fail("an empty page")
+    match s3op.read_list(error_reply(403, "AccessDenied"))
+        Err(f) => test.assert(is_service(f, 403, S3AccessDenied))
+        Ok(_)  => test.fail("a 403")
+    match s3op.read_delete_many(reply(200, [], bytes.to_str(doc("DeleteResult", "<Deleted><Key>a</Key></Deleted>"))))
+        Ok(os) => test.assert_eq(list.len(os), 1)
+        Err(_) => test.fail("a result")
+    match s3op.read_delete_many(reply(200, [], "<Error><Code>InternalError</Code></Error>"))
+        Err(f) => test.assert(is_service(f, 200, S3InternalError))
+        Ok(_)  => test.fail("an Error inside a 200")
+    match s3op.read_delete_many(error_reply(400, "MalformedXML"))
+        Err(f) => test.assert(is_service(f, 400, S3MalformedXml))
+        Ok(_)  => test.fail("a 400")
+
+@test
+fn test_etags_and_in_band_errors() [io]
+    test.assert_eq_str(s3op.etag_unquoted("W/\"abc\""), "abc")
+    test.assert_eq_str(s3op.etag_unquoted(" \"abc\" "), "abc")
+    test.assert_eq_str(s3op.etag_unquoted("abc"), "abc")
+    test.assert_eq_str(s3op.etag_unquoted("\""), "\"")
+    test.assert_eq(s3op.etag_part_count("\"abc-3\""), 0)
+    test.assert_eq(s3op.etag_part_count("\"d41d8cd98f00b204e9800998ecf8427e-x\""), 0)
+    test.assert_eq(s3op.etag_part_count("\"d41d8cd98f00b204e9800998ecf8427e-1-2\""), 0)
+    test.assert(not s3op.body_is_error(reply(200, [], "")))
+    test.assert(not s3op.body_is_error(reply(200, [], "<CopyObjectResult/>")))
+    test.assert(s3op.body_is_error(reply(200, [], "<Error/>")))
+    test.assert(s3op.conditional_writes_supported(example_cfg()) == Some(true))
+    test.assert(s3op.conditional_writes_supported(s3cfg.minio("http", "h", 9000, "r", example_key())) == None)
+    match s3op.fault_of_reply(reply(502, [], "<html>bad gateway</html>"))
+        S3FaultService(502, d) => test.assert_eq_str(d.message, "<html>bad gateway</html>")
+        _                      => test.fail("a service fault")
+
+// ── Multipart ────────────────────────────────────────────────────────
+
+fn start_reply() -> S3Reply
+    reply(200,
+        [],
+        bytes.to_str(doc("InitiateMultipartUploadResult", "<Bucket>b</Bucket><Key>k</Key><UploadId>u1</UploadId>")))
+
+fn part_reply(etag: Str) -> S3Reply
+    reply(200, ["ETag: " + etag], "")
+
+fn fresh() -> S3Mpu
+    match s3mpu.upload("b", "k", 10485761, s3op.S3_PART_MIN_BYTES)
+        Ok(u)  => u
+        Err(_) => S3Mpu { bucket: "b", key: "k", upload_id: "", state: S3MpuFresh, total: 0, parts: [],
+                          uploaded: 0, failure: None, outcome: None }
+
+fn opened() -> S3Mpu
+    match s3mpu.supply_start(fresh(), start_reply())
+        Ok(u)  => u
+        Err(_) => fresh()
+
+fn with_state(u: S3Mpu, state: S3MpuState) -> S3Mpu
+    S3Mpu { bucket: u.bucket, key: u.key, upload_id: u.upload_id, state: state, total: u.total,
+            parts: u.parts, uploaded: u.uploaded, failure: u.failure, outcome: u.outcome }
+
+@test
+fn test_the_plan_and_its_limits() [io]
+    match s3mpu.plan_parts(10485761, s3op.S3_PART_MIN_BYTES)
+        Ok(ps) =>
+            test.assert_eq(list.len(ps), 3)
+            test.assert_eq(ps[2].length, 1)
+            test.assert_eq(ps[2].offset, 10485760)
+            test.assert_eq(ps[1].number, 2)
+        Err(_) => test.fail("three parts")
+    test.case("an exact multiple has no runt")
+    test.assert_eq(plan_len(s3mpu.plan_parts(10485760, s3op.S3_PART_MIN_BYTES)), 2)
+    test.case("nothing, too large, below the floor are refused; above the ceiling is clamped")
+    test.assert_eq(plan_len(s3mpu.plan_parts(0, s3op.S3_PART_MIN_BYTES)), 0 - 1)
+    match s3mpu.plan_parts(s3mpu.S3_OBJECT_MAX_BYTES + 1, s3op.S3_PART_MIN_BYTES)
+        Err(f) => test.assert(is_service(f, 400, S3EntityTooLarge))
+        Ok(_)  => test.fail("six tebibytes")
+    match s3mpu.planned_part_size(10485761, 10 * s3mpu.S3_PART_MAX_BYTES)
+        Ok(n)  => test.assert_eq(n, s3mpu.S3_PART_MAX_BYTES)
+        Err(_) => test.fail("clamped")
+    match s3mpu.planned_part_size(s3mpu.S3_OBJECT_MAX_BYTES, s3op.S3_PART_MIN_BYTES)
+        Ok(n)  => test.assert(n * s3mpu.S3_MAX_PARTS >= s3mpu.S3_OBJECT_MAX_BYTES and n % 1048576 == 0)
+        Err(_) => test.fail("a five-tebibyte object plans")
+    test.assert(s3mpu.part_size_ok(s3mpu.S3_PART_MAX_BYTES))
+    test.assert(not s3mpu.part_size_ok(s3mpu.S3_PART_MAX_BYTES + 1))
+    test.assert(s3mpu.needs_multipart(s3op.S3_PUT_MAX_BYTES + 1))
+    test.assert(not s3mpu.needs_multipart(s3op.S3_PUT_MAX_BYTES))
+    match s3mpu.upload("b", "", 100, s3op.S3_PART_MIN_BYTES)
+        Err(S3FaultBadKey(_)) => test.assert(true)
+        _                     => test.fail("an empty key")
+    match s3mpu.upload("b", "k", 100, 1)
+        Err(S3FaultPartTooSmall(_, _)) => test.assert(true)
+        _                              => test.fail("below the floor")
+
+fn plan_len(r: Result<[S3MpuPart], S3Fault>) -> Int
+    match r
+        Ok(ps) => list.len(ps)
+        Err(_) => 0 - 1
+
+@test
+fn test_an_upload_walks_from_fresh_to_full() [io]
+    test.case("a fresh upload initiates")
+    let u0 = fresh()
+    match s3mpu.step(u0)
+        S3MpuSendInitiate(r) =>
+            test.assert_eq_str(r.method, "POST")
+            test.assert_eq_str(query_of(r, "uploads"), "")
+        _                    => test.fail("initiate first")
+    test.assert(not s3mpu.owes_abort(u0))
+    test.assert_eq_str(s3mpu.upload_id_of(opened()), "u1")
+    test.assert(s3mpu.owes_abort(opened()))
+    test.case("parts go in order and carry their number and id")
+    match s3mpu.step(opened())
+        S3MpuSendPart(n, off, len, r) =>
+            test.assert_eq(n, 1)
+            test.assert_eq(off, 0)
+            test.assert_eq(len, s3op.S3_PART_MIN_BYTES)
+            test.assert_eq_str(query_of(r, "partNumber"), "1")
+            test.assert_eq_str(query_of(r, "uploadId"), "u1")
+        _                             => test.fail("part one")
+    test.case("each reply stores its ETag and the last one fills the upload")
+    match s3mpu.supply_part(opened(), 1, part_reply("\"a\""))
+        Err(_) => test.fail("a part")
+        Ok(u1) =>
+            test.assert(s3mpu.progress_of(u1) == (1, 3))
+            test.assert(s3mpu.state_of(u1) == S3MpuOpen)
+            test.assert_eq_str(s3mpu.parts_of(u1)[0].etag, "\"a\"")
+            match s3mpu.step(u1)
+                S3MpuSendPart(n, _, _, _) => test.assert_eq(n, 2)
+                _                         => test.fail("part two")
+            match s3mpu.supply_part(u1, 2, part_reply("\"b\""))
+                Err(_) => test.fail("a part")
+                Ok(u2) =>
+                    match s3mpu.supply_part(u2, 3, part_reply("\"c\""))
+                        Err(_) => test.fail("a part")
+                        Ok(u3) =>
+                            test.assert(s3mpu.state_of(u3) == S3MpuFull)
+                            match s3mpu.completion(u3)
+                                Ok(ps) => test.assert_eq(list.len(ps), 3)
+                                Err(_) => test.fail("complete")
+                            match s3mpu.step(u3)
+                                S3MpuSendComplete(r) =>
+                                    test.assert_eq_str(query_of(r, "uploadId"), "u1")
+                                    test.assert_eq_str(r.method, "POST")
+                                _                    => test.fail("complete")
+    test.case("a part reply without an ETag, or a stranger part, is refused")
+    test.assert(bad_xml_of(s3mpu.supply_part(opened(), 1, reply(200, [], ""))))
+    match s3mpu.supply_part(opened(), 9, part_reply("\"a\""))
+        Err(S3FaultPartOutOfOrder(9, 0)) => test.assert(true)
+        _                                => test.fail("no part nine")
+    match s3mpu.supply_part(opened(), 1, error_reply(500, "InternalError"))
+        Err(f) => test.assert(is_service(f, 500, S3InternalError))
+        Ok(_)  => test.fail("a 500")
+    test.case("an incomplete upload cannot be completed")
+    match s3mpu.completion(opened())
+        Err(f) => test.assert(is_service(f, 400, S3InvalidPart))
+        Ok(_)  => test.fail("parts are missing")
+    match s3mpu.step(with_state(opened(), S3MpuFull))
+        S3MpuMustAbort(f, _) => test.assert(is_service(f, 400, S3InvalidPart))
+        _                    => test.fail("a full upload with a gap must abort")
+
+@test
+fn test_start_and_complete_replies() [io]
+    test.assert(bad_xml_of(s3mpu.supply_start(opened(), start_reply())))
+    match s3mpu.supply_start(fresh(), error_reply(403, "AccessDenied"))
+        Err(f) => test.assert(is_service(f, 403, S3AccessDenied))
+        Ok(_)  => test.fail("a 403")
+    test.assert(bad_xml_of(s3mpu.supply_start(fresh(), reply(200, [], "<x/>"))))
+    let done = reply(200,
+        [],
+        bytes.to_str(doc("CompleteMultipartUploadResult", "<Bucket>b</Bucket><Key>k</Key><ETag>&quot;z-3&quot;</ETag>")))
+    match s3mpu.supply_complete(opened(), done)
+        Ok(d)  => test.assert_eq_str(d.etag, "\"z-3\"")
+        Err(_) => test.fail("a completion")
+    match s3mpu.supply_complete(opened(), error_reply(404, "NoSuchUpload"))
+        Err(f) => test.assert(is_service(f, 404, S3NoSuchUpload))
+        Ok(_)  => test.fail("a 404")
+
+@test
+fn test_failure_and_abort() [io]
+    test.case("an open upload that failed must be aborted")
+    match s3mpu.step(s3mpu.fail(opened(), S3FaultTransport("died")))
+        S3MpuMustAbort(_, r) =>
+            test.assert_eq_str(r.method, "DELETE")
+            test.assert_eq_str(query_of(r, "uploadId"), "u1")
+        _                    => test.fail("an abort is owed")
+    match s3mpu.step(s3mpu.fail(fresh(), S3FaultTransport("died")))
+        S3MpuFailed(_) => test.assert(true)
+        _              => test.fail("nothing is owed")
+    test.case("abort answers a request, or says there is nothing to abort")
+    match s3mpu.abort(opened())
+        Ok(r)  => test.assert_eq_str(r.key, "k")
+        Err(_) => test.fail("an abort")
+    match s3mpu.abort(fresh())
+        Err(f) => test.assert(is_service(f, 404, S3NoSuchUpload))
+        Ok(_)  => test.fail("nothing to abort")
+    test.case("the terminal states")
+    let aborted = with_state(opened(), S3MpuAborted)
+    test.assert(not s3mpu.owes_abort(aborted))
+    match s3mpu.step(aborted)
+        S3MpuFailed(f) => test.assert(is_service(f, 404, S3NoSuchUpload))
+        _              => test.fail("an aborted upload is over")
+    let finished = with_state(opened(), S3MpuDone)
+    test.assert(not s3mpu.owes_abort(finished))
+    match s3mpu.step(finished)
+        S3MpuFinished(d) => test.assert_eq_str(d.key, "k")
+        _                => test.fail("finished")
+    match s3mpu.step(with_state(finished, S3MpuOpen))
+        S3MpuSendPart(_, _, _, _) => test.assert(true)
+        _                         => test.fail("open")
+    test.case("a complete list of parts leaves no part to send")
+    match s3mpu.resume("b", "k", "u1", 10485761, s3op.S3_PART_MIN_BYTES, [])
+        Ok(u)  =>
+            let full = S3Mpu { bucket: u.bucket, key: u.key, upload_id: u.upload_id, state: S3MpuOpen,
+                               total: u.total, parts: [], uploaded: 0, failure: None, outcome: None }
+            match s3mpu.step(full)
+                S3MpuFailed(_) => test.assert(true)
+                _              => test.fail("no part left")
+        Err(_) => test.fail("a resume")
+
+@test
+fn test_resume_and_the_two_listings() [io]
+    let known = [S3PartInfo { part_number: 1, etag: "\"a\"", size: 5242880, last_modified: "" },
+                 S3PartInfo { part_number: 3, etag: "\"c\"", size: 1, last_modified: "" }]
+    match s3mpu.resume("b", "k", "u1", 10485761, s3op.S3_PART_MIN_BYTES, known)
+        Ok(u)  =>
+            test.assert(s3mpu.progress_of(u) == (2, 3))
+            test.assert(s3mpu.state_of(u) == S3MpuOpen)
+            match s3mpu.step(u)
+                S3MpuSendPart(n, _, _, _) => test.assert_eq(n, 2)
+                _                         => test.fail("part two is missing")
+        Err(_) => test.fail("a resume")
+    test.case("every part known makes the upload full")
+    let all = [S3PartInfo { part_number: 1, etag: "a", size: 5242880, last_modified: "" },
+               S3PartInfo { part_number: 2, etag: "b", size: 5242880, last_modified: "" },
+               S3PartInfo { part_number: 3, etag: "c", size: 1, last_modified: "" }]
+    match s3mpu.resume("b", "k", "u1", 10485761, s3op.S3_PART_MIN_BYTES, all)
+        Ok(u)  => test.assert(s3mpu.state_of(u) == S3MpuFull)
+        Err(_) => test.fail("a resume")
+    test.case("a listing that disagrees with the plan, or no id, is refused")
+    test.assert(bad_xml_of(s3mpu.resume("b", "k", "u1", 10485761, s3op.S3_PART_MIN_BYTES,
+                                        [S3PartInfo { part_number: 9, etag: "x", size: 1, last_modified: "" }])))
+    test.assert(bad_xml_of(s3mpu.resume("b", "k", "u1", 10485761, s3op.S3_PART_MIN_BYTES,
+                                        [S3PartInfo { part_number: 1, etag: "x", size: 7, last_modified: "" }])))
+    test.assert(bad_xml_of(s3mpu.resume("b", "k", "", 10485761, s3op.S3_PART_MIN_BYTES, [])))
+    match s3mpu.resume("b", "", "u1", 100, s3op.S3_PART_MIN_BYTES, [])
+        Err(S3FaultBadKey(_)) => test.assert(true)
+        _                     => test.fail("an empty key")
+    test.case("the listing requests")
+    let lp = s3mpu.list_parts_request("b", "k", "u1", 4)
+    test.assert_eq_str(query_of(lp, "part-number-marker"), "4")
+    test.assert_eq_str(query_of(s3mpu.list_parts_request("b", "k", "u1", 0), "part-number-marker"), "<absent>")
+    test.assert_eq_str(query_of(s3mpu.list_uploads_request("b", "p"), "prefix"), "p")
+    test.assert_eq_str(query_of(s3mpu.list_uploads_request("b", ""), "prefix"), "<absent>")
+
+// ── The client, over a transport that costs nothing ──────────────────
+
+// A scripted store.  `mode` 0 answers like a service would, 1 fails the
+// transport, 2 answers every request 403, 3 answers parts without an
+// ETag.
+struct Script
+    mode: Int
+
+fn cfg_plain() -> S3Config
+    s3cfg.minio("http", "127.0.0.1", 9000, "us-east-1", s3cfg.credentials("k", "s"))
+
+fn answer(mode: Int, method: Str, target: Str) -> Result<S3Reply, S3Fault>
+    if mode == 1
+        Err(S3FaultTransport("reset"))
+    else if mode == 2
+        Ok(error_reply(403, "AccessDenied"))
+    else if method == "POST" and str.contains(target, "uploads=")
+        Ok(start_reply())
+    else if method == "PUT" and str.contains(target, "partNumber=") and mode == 3
+        Ok(reply(200, [], ""))
+    else if method == "PUT" and str.contains(target, "partNumber=")
+        Ok(part_reply("\"p\""))
+    else if method == "POST" and str.contains(target, "uploadId=")
+        Ok(reply(200, [], bytes.to_str(doc("CompleteMultipartUploadResult",
+            "<Bucket>b</Bucket><Key>k</Key><ETag>&quot;done-2&quot;</ETag>"))))
+    else if method == "PUT" and str.contains(target, "dst")
+        Ok(reply(200, [], bytes.to_str(doc("CopyObjectResult", "<ETag>&quot;c&quot;</ETag>"))))
+    else if method == "PUT"
+        Ok(reply(200, ["ETag: \"put\""], ""))
+    else if method == "DELETE"
+        Ok(reply(204, [], ""))
+    else if method == "HEAD"
+        Ok(reply(200, ["Content-Length: 4", "ETag: \"h\""], ""))
+    else if method == "GET" and str.contains(target, "list-type=2")
+        Ok(reply(200,
+            [],
+            bytes.to_str(list_doc("<IsTruncated>false</IsTruncated><Contents><Key>a</Key></Contents>"))))
+    else
+        Ok(reply(200, ["Content-Length: 4", "Content-Range: bytes 0-3/9"], "body"))
+
+impl S3Transport[] for Script
+    fn s3_exchange(self, origin: Str, method: Str, target: Str, headers: [S3Header],
+                   body: Bytes) -> Result<S3Reply, S3Fault> []
+        answer(self.mode, method, target)
+
+    fn s3_open(self, origin: Str, method: Str, target: Str, headers: [S3Header],
+               body: Bytes) -> Result<S3Reply, S3Fault> []
+        match answer(self.mode, method, target)
+            Err(f) => Err(f)
+            Ok(r)  => Ok(S3Reply { status: r.status, headers: r.headers, body: bytes.zeros(0), streamed: true })
+
+    fn s3_read(self, max: Int) -> Result<Bytes, S3Fault> []
+        if self.mode == 1
+            Err(S3FaultTransport("reset"))
+        else if self.mode == 4
+            Ok(bytes.zeros(0))
+        else if max < 4
+            Ok(bytes.from_str(str.slice("wxyz", 0, max)))
+        else
+            Ok(bytes.from_str("wxyz"))
+
+    fn s3_close(self) -> ?S3Fault []
+        None
+
+fn at_now() -> CivilDateTime
+    example_at()
+
+fn client_of() -> S3Client
+    s3client.client(cfg_plain())
+
+fn run_all(t: Script) -> Int []
+    let c = client_of()
+    var n = 0
+    match s3client.get_object(c, t, "b", "k", at_now())
+        Ok(o)  =>
+            n = n + bytes.len(o.body)
+        Err(_) =>
+            n = n + 0
+    match s3client.get_range(c, t, "b", "k", 0, 3, at_now())
+        Ok(o)  =>
+            n = n + bytes.len(o.body)
+        Err(_) =>
+            n = n + 0
+    match s3client.head_object(c, t, "b", "k", at_now())
+        Ok(h)  =>
+            n = n + h.content_length
+        Err(_) =>
+            n = n + 0
+    match s3client.put_object(c, t, "b", "k", bytes.from_str("v"), at_now())
+        Ok(_)  =>
+            n = n + 1
+        Err(_) =>
+            n = n + 0
+    match s3client.delete_object(c, t, "b", "k", at_now())
+        None    =>
+            n = n + 1
+        Some(_) =>
+            n = n + 0
+    match s3client.copy_object(c, t, "b", "src", "b", "dst", at_now())
+        Ok(_)  =>
+            n = n + 1
+        Err(_) =>
+            n = n + 0
+    match s3client.list_page(c, t, "b", "", "/", 10, None, at_now())
+        Ok(p)  =>
+            n = n + list.len(p.entries)
+        Err(_) =>
+            n = n + 0
+    match s3client.abort_upload(c, t, "b", "k", "u1", at_now())
+        None    =>
+            n = n + 1
+        Some(_) =>
+            n = n + 0
+    n
+
+@test
+fn test_every_call_runs_at_no_effect_over_a_script() []
+    test.case("a working store answers every call")
+    test.assert_eq(run_all(Script { mode: 0 }), 4 + 4 + 4 + 1 + 1 + 1 + 1 + 1)
+    test.case("a dead transport and a refusing service answer none of them")
+    test.assert_eq(run_all(Script { mode: 1 }), 0)
+    test.assert_eq(run_all(Script { mode: 2 }), 0)
+
+@test
+fn test_the_headers_the_transport_receives_are_signed_and_not_the_host() [io]
+    match s3client.get_object(client_of(), Script { mode: 0 }, "b", "a b", at_now())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.fail("a get")
+    test.case("a bucket that cannot be addressed never reaches the transport")
+    match s3client.get_object(s3client.client(example_cfg()), Script { mode: 0 }, "X", "k", at_now())
+        Err(_) => test.assert(true)
+        Ok(_)  => test.fail("a bad bucket")
+    test.case("a key past the ceiling is refused with a good bucket")
+    match s3client.get_object(client_of(), Script { mode: 0 }, "b", str.repeat("k", 2000), at_now())
+        Err(S3FaultBadKey(_)) => test.assert(true)
+        _                     => test.fail("a long key")
+    test.case("an unsigned body over http is refused before it is sent")
+    let r = s3req.with_body(s3req.request("PUT", "b", "k"), S3BodyStreamedUnhashed(5))
+    match s3client.send(client_of(), Script { mode: 0 }, r, at_now())
+        Err(S3FaultUnsignedOverPlaintext(_)) => test.assert(true)
+        _                                    => test.fail("refused")
+    match s3client.open(client_of(), Script { mode: 0 }, r, at_now())
+        Err(S3FaultUnsignedOverPlaintext(_)) => test.assert(true)
+        _                                    => test.fail("refused")
+    test.case("a query is signed and sent in the target")
+    match s3client.open(client_of(), Script { mode: 0 }, s3op.list("b", "", "", 5, None), at_now())
+        Ok(rep) => test.assert(rep.streamed)
+        Err(_)  => test.fail("an open")
+
+// The bytes the next step wants, and a pump over them.
+fn part_for(u: S3Mpu) -> Bytes
+    match s3mpu.step(u)
+        S3MpuSendPart(_, _, length, _) => bytes.zeros(length)
+        _                              => bytes.zeros(0)
+
+fn pump_once(t: Script, u: S3Mpu) -> Result<S3Mpu, S3Fault> []
+    s3client.pump(client_of(), t, u, part_for(u), at_now())
+
+fn planned() -> S3Mpu
+    match s3mpu.upload("b", "k", 5242881, s3op.S3_PART_MIN_BYTES)
+        Ok(x)  => x
+        Err(_) => fresh()
+
+fn pumped(t: Script, steps: Int) -> S3Mpu []
+    var u = planned()
+    var failed = 0
+    for _i in 0..steps
+        match pump_once(t, u)
+            Ok(next) =>
+                u = next
+            Err(_)   =>
+                failed = failed + 1
+    u
+
+@test
+fn test_a_pump_drives_an_upload_to_its_end() [io]
+    test.case("initiate, two parts and the completion, one call each")
+    test.assert(s3mpu.state_of(pumped(Script { mode: 0 }, 1)) == S3MpuOpen)
+    test.assert(s3mpu.progress_of(pumped(Script { mode: 0 }, 2)) == (1, 2))
+    test.assert(s3mpu.state_of(pumped(Script { mode: 0 }, 3)) == S3MpuFull)
+    let done = pumped(Script { mode: 0 }, 4)
+    test.assert(s3mpu.state_of(done) == S3MpuDone)
+    match done.outcome
+        Some(d) => test.assert_eq_str(d.etag, "\"done-2\"")
+        None    => test.fail("the completion's document is kept")
+    test.case("a finished upload has nothing left to send")
+    match s3client.pump(client_of(), Script { mode: 0 }, done, bytes.zeros(0), at_now())
+        Ok(u)  => test.assert(s3mpu.state_of(u) == S3MpuDone)
+        Err(_) => test.fail("finished")
+
+@test
+fn test_a_pump_reports_what_went_wrong() [io]
+    test.case("a part of the wrong length is a truncation")
+    match s3client.pump(client_of(), Script { mode: 0 }, pumped(Script { mode: 0 }, 1), bytes.zeros(3), at_now())
+        Err(S3FaultTruncatedBody(_, 3)) => test.assert(true)
+        _                               => test.fail("a short part")
+    test.case("a transport that dies, a refusal and a part without an ETag")
+    test.assert(pump_failed(pump_once(Script { mode: 1 }, planned())))
+    test.assert(pump_failed(pump_once(Script { mode: 2 }, planned())))
+    test.assert(pump_failed(pump_once(Script { mode: 1 }, pumped(Script { mode: 0 }, 1))))
+    test.assert(pump_failed(pump_once(Script { mode: 3 }, pumped(Script { mode: 0 }, 1))))
+    test.assert(pump_failed(pump_once(Script { mode: 2 }, pumped(Script { mode: 0 }, 3))))
+    test.assert(pump_failed(pump_once(Script { mode: 1 }, pumped(Script { mode: 0 }, 3))))
+    test.case("a failed upload says so to the pump")
+    test.assert(pump_failed(pump_once(Script { mode: 0 }, s3mpu.fail(pumped(Script { mode: 0 }, 1), S3FaultTransport("x")))))
+    test.assert(pump_failed(pump_once(Script { mode: 0 }, s3mpu.fail(planned(), S3FaultTransport("x")))))
+
+fn pump_failed(r: Result<S3Mpu, S3Fault>) -> Bool
+    match r
+        Ok(_)  => false
+        Err(_) => true
+
+@test
+fn test_a_download_drains_into_the_callers_buffer() [io]
+    test.case("a transport that answers four bytes at a time fills a nine-byte request")
+    var buf = bytes.zeros(16)
+    match s3client.drain_into(Script { mode: 0 }, var buf, 9)
+        Ok(n)  =>
+            test.assert_eq(n, 9)
+            test.assert_eq_str(bytes.to_str(bytes.slice(buf, 0, 9)), "wxyzwxyzw")
+        Err(_) => test.fail("a drain")
+    test.case("a peer that closes early is a truncation, a failing one its own fault")
+    var short = bytes.zeros(16)
+    match s3client.drain_into(Script { mode: 4 }, var short, 5)
+        Err(S3FaultTruncatedBody(5, 0)) => test.assert(true)
+        _                               => test.fail("closed early")
+    match s3client.drain_into(Script { mode: 1 }, var short, 5)
+        Err(S3FaultTransport(_)) => test.assert(true)
+        _                        => test.fail("a reset")
+    test.case("a buffer smaller than the request stops where it is full")
+    var small = bytes.zeros(2)
+    match s3client.drain_into(Script { mode: 0 }, var small, 9)
+        Err(S3FaultTruncatedBody(9, 2)) => test.assert(true)
+        _                               => test.fail("no room")
+    test.case("nothing wanted is nothing read")
+    match s3client.drain_into(Script { mode: 0 }, var small, 0)
+        Ok(n)  => test.assert_eq(n, 0)
+        Err(_) => test.fail("zero")
+    test.assert(Script { mode: 0 }.s3_close() == None)
+
+@test
+fn test_the_clock_and_the_environment() [io, time]
+    let now = s3client.now_civil()
+    test.assert(now.date.year >= 2026)
+    test.assert(now.time.hour >= 0 and now.time.hour < 24)
+    test.case("no key, no secret, an empty pair, a pair, a pair with a token")
+    process.env_set("AWS_ACCESS_KEY_ID", "")
+    process.env_set("AWS_SECRET_ACCESS_KEY", "")
+    process.env_set("AWS_SESSION_TOKEN", "")
+    test.assert(s3client.credentials_from_env() == None)
+    process.env_set("AWS_ACCESS_KEY_ID", "AK")
+    test.assert(s3client.credentials_from_env() == None)
+    process.env_set("AWS_SECRET_ACCESS_KEY", "SK")
+    match s3client.credentials_from_env()
+        Some(c) =>
+            test.assert_eq_str(c.access_key_id, "AK")
+            test.assert_eq_str(c.session_token, "")
+        None    => test.fail("both are set")
+    process.env_set("AWS_SESSION_TOKEN", "TK")
+    match s3client.credentials_from_env()
+        Some(c) => test.assert_eq_str(c.session_token, "TK")
+        None    => test.fail("both are set")
+    process.env_set("AWS_ACCESS_KEY_ID", "")
+    test.assert(s3client.credentials_from_env() == None)
+
+// ── The shipped transport, against a socket in this process ──────────
+
+// One connection: read the request, answer 200 when it carries a
+// signature and 403 when it does not, and close.
+async fn serve_one(srv: Sock) -> Int [io, net, time, async, mutate]
+    match net.accept_async(srv, 8000)
+        None       => 0 - 1
+        Some(pair) =>
+            match pair
+                (c, _) =>
+                    let head = net.recv_async(c, 65536, 4000) ?? ""
+                    let ok = str.contains(head, "Authorization: AWS4-HMAC-SHA256 Credential=k/")
+                    let line = if ok
+                        "HTTP/1.1 200 OK\r\nETag: \"abc\"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    else
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    let _sent = net.send(c, line)
+                    net.close(c)
+                    if ok
+                        1
+                    else
+                        0
+
+fn test_close(t: S3StdHttp) -> Int [io, net, time, async]
+    match t.s3_close()
+        None    => 0
+        Some(_) => 0
+
+async fn call_once(port: Int) -> Int [io, net, time, async]
+    let cfg = s3cfg.minio("http", "127.0.0.1", port, "us-east-1", s3cfg.credentials("k", "s"))
+    match s3client.std_http(cfg, 4000)
+        Err(_) => 0 - 2
+        Ok(t)  =>
+            match s3client.put_object(s3client.client(cfg), t, "b", "k", bytes.from_str("v"), at_now())
+                Err(_)  => 0 - 3
+                Ok(put) =>
+                    let _closed = test_close(t)
+                    if put.etag == "\"abc\""
+                        1
+                    else
+                        0 - 4
+
+@test
+async fn test_the_shipped_transport_speaks_to_a_socket() [io, net, ipc, time, async, mutate]
+    match net.listen_on("127.0.0.1", 39517)
+        None      => test.fail("port 39517 is busy")
+        Some(srv) =>
+            let rs = await all([serve_one(srv), call_once(39517)])
+            net.close(srv)
+            test.assert_eq(rs[0], 1)
+            test.assert_eq(rs[1], 1)

@@ -1,7 +1,5 @@
 // s3xml.nv — the XML S3 answers in, read over xml-nv's tree.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  A parse is a parse.
 //
 // THIS MODULE PARSES NO XML.  xml-nv builds the tree; every function
@@ -24,9 +22,68 @@
 // and `S3ListPage.encoding` records which it was so a caller reading
 // raw XML elsewhere is not misled.
 
-// One object in a listing.
+use std.bytes
+use std.list
+use std.str
+use xmltree
+use xmlfind
+use pct
 use s3fault
 
+// The namespace every S3 result document is written in.
+const S3_XML_NAMESPACE = "http://s3.amazonaws.com/doc/2006-03-01/"
+
+// A parsed document and the index of its document element.
+struct S3XmlRoot
+    doc: XmlDocument
+    root: Int
+
+// The document elements this package reads.
+fn s3_roots() -> [Str]
+    ["ListBucketResult", "InitiateMultipartUploadResult", "CompleteMultipartUploadResult",
+     "ListPartsResult", "DeleteResult", "CopyObjectResult", "Error"]
+
+// The document element, when it has this local name.
+fn root_of(doc: XmlDocument, local: Str) -> ?Int
+    match xmltree.document_element(doc)
+        None       => None
+        Some(root) =>
+            if xmltree.local_of(doc, root) == local
+                Some(root)
+            else
+                None
+
+// Parse a reply that must be this result document, in the S3 namespace.
+fn open_doc(body: Bytes, local: Str) -> Result<S3XmlRoot, S3Fault>
+    let doc = xmltree.build(bytes.to_str(body))
+    match root_of(doc, local)
+        None       => Err(S3FaultBadXml("the reply is not a " + local + " document"))
+        Some(root) =>
+            if xmltree.namespace_of(doc, root) == Some(S3_XML_NAMESPACE)
+                Ok(S3XmlRoot { doc: doc, root: root })
+            else
+                Err(S3FaultBadXml("the " + local + " document is not in the S3 namespace"))
+
+// Like `open_doc`, except that an `<Error>` document in its place is
+// the failure it describes: a completion or a copy answers 200 first.
+fn open_doc_or_error(body: Bytes, local: Str) -> Result<S3XmlRoot, S3Fault>
+    let doc = xmltree.build(bytes.to_str(body))
+    match root_of(doc, "Error")
+        Some(_) => Err(S3FaultService(200, error_doc(body)))
+        None    => open_doc(body, local)
+
+// A key or prefix out of a listing that asked for URL encoding.  S3
+// writes a space as `+` there and a literal plus as `%2B`.
+fn unwrap_key(v: Str, encoded: Bool) -> Str
+    if encoded
+        pct.decode(str.replace(v, "+", " "))
+    else
+        v
+
+fn escape(v: Str) -> Str
+    str.replace(str.replace(str.replace(v, "&", "&amp;"), "<", "&lt;"), ">", "&gt;")
+
+// One object in a listing.
 pub struct S3ListEntry
     // The key, already decoded when the listing was URL-encoded.
     key: Str
@@ -108,7 +165,15 @@ pub struct S3DeleteOutcome
 // `S3FaultBadXml` naming what it was, because the alternative is
 // reading a proxy's error page as a listing with no objects in it.
 pub fn is_s3_document(doc: XmlDocument) -> Bool []
-    todo("s3-nv.s3xml.is_s3_document")
+    match xmltree.document_element(doc)
+        None       => false
+        Some(root) =>
+            if not list.contains(s3_roots(), xmltree.local_of(doc, root))
+                false
+            else
+                match xmltree.namespace_of(doc, root)
+                    Some(uri) => uri == S3_XML_NAMESPACE
+                    None      => xmltree.local_of(doc, root) == "Error"
 
 // An `<Error>` document.
 //
@@ -126,15 +191,72 @@ pub fn is_s3_document(doc: XmlDocument) -> Bool []
 //     s3xml.error_doc(b).code
 // ```
 pub fn error_doc(body: Bytes) -> S3ErrorDoc []
-    todo("s3-nv.s3xml.error_doc")
+    let text = bytes.to_str(body)
+    let doc = xmltree.build(text)
+    match root_of(doc, "Error")
+        Some(root) =>
+            S3ErrorDoc { code: s3fault.code_of_text(xmlfind.findtext(doc, root, "Code", "")),
+                         message: xmlfind.findtext(doc, root, "Message", ""),
+                         resource: xmlfind.findtext(doc, root, "Resource", ""),
+                         request_id: xmlfind.findtext(doc, root, "RequestId", ""),
+                         host_id: xmlfind.findtext(doc, root, "HostId", "") }
+        None       =>
+            let trimmed = str.trim(text)
+            let first = match str.index(trimmed, "\n")
+                Some(i) => str.slice(trimmed, 0, i)
+                None    => trimmed
+            S3ErrorDoc { code: S3OtherCode(""), message: first, resource: "", request_id: "",
+                         host_id: "" }
 
 // A `ListBucketResult`.
 pub fn list_result(body: Bytes) -> Result<S3ListPage, S3Fault> []
-    todo("s3-nv.s3xml.list_result")
+    match open_doc(body, "ListBucketResult")
+        Err(f) => Err(f)
+        Ok(d)  =>
+            let doc = d.doc
+            let root = d.root
+            let encoded = xmlfind.findtext(doc, root, "EncodingType", "") == "url"
+            var entries: [S3ListEntry] = []
+            for c in xmlfind.findall(doc, root, "Contents")
+                let size = str.to_int(xmlfind.findtext(doc, c, "Size", "0")) ?? 0
+                entries = list.concat(entries, [S3ListEntry {
+                    key: unwrap_key(xmlfind.findtext(doc, c, "Key", ""), encoded),
+                    last_modified: xmlfind.findtext(doc, c, "LastModified", ""),
+                    etag: xmlfind.findtext(doc, c, "ETag", ""),
+                    size: size,
+                    storage_class: xmlfind.findtext(doc, c, "StorageClass", "") }])
+            var prefixes: [Str] = []
+            for c in xmlfind.findall(doc, root, "CommonPrefixes")
+                prefixes = list.concat(prefixes, [unwrap_key(xmlfind.findtext(doc, c, "Prefix", ""), encoded)])
+            let truncated = xmlfind.findtext(doc, root, "IsTruncated", "false") == "true"
+            let token = xmlfind.findtext(doc, root, "NextContinuationToken", "")
+            if truncated and token == ""
+                Err(S3FaultBadXml("the page is truncated and names no NextContinuationToken"))
+            else if not truncated and token != ""
+                Err(S3FaultBadXml("the page is complete and names a NextContinuationToken"))
+            else
+                let next: ?Str = if truncated
+                    Some(token)
+                else
+                    None
+                let count = str.to_int(xmlfind.findtext(doc, root, "KeyCount", "")) ?? list.len(entries) + list.len(prefixes)
+                Ok(S3ListPage { entries: entries, prefixes: prefixes, is_truncated: truncated,
+                                next_continuation: next, key_count: count,
+                                prefix: unwrap_key(xmlfind.findtext(doc, root, "Prefix", ""), encoded),
+                                delimiter: unwrap_key(xmlfind.findtext(doc, root, "Delimiter", ""), encoded),
+                                encoding: encoded })
 
 // An `InitiateMultipartUploadResult`.
 pub fn upload_start(body: Bytes) -> Result<S3UploadStart, S3Fault> []
-    todo("s3-nv.s3xml.upload_start")
+    match open_doc(body, "InitiateMultipartUploadResult")
+        Err(f) => Err(f)
+        Ok(d)  =>
+            let id = xmlfind.findtext(d.doc, d.root, "UploadId", "")
+            if id == ""
+                Err(S3FaultBadXml("InitiateMultipartUploadResult carries no UploadId"))
+            else
+                Ok(S3UploadStart { bucket: xmlfind.findtext(d.doc, d.root, "Bucket", ""),
+                                   key: xmlfind.findtext(d.doc, d.root, "Key", ""), upload_id: id })
 
 // A `CompleteMultipartUploadResult`.
 //
@@ -147,15 +269,33 @@ pub fn upload_start(body: Bytes) -> Result<S3UploadStart, S3Fault> []
 // `<Error>`, and `s3op.body_is_error` is the same check spelled for a
 // caller reading the body itself.
 pub fn upload_done(body: Bytes) -> Result<S3UploadDone, S3Fault> []
-    todo("s3-nv.s3xml.upload_done")
+    match open_doc_or_error(body, "CompleteMultipartUploadResult")
+        Err(f) => Err(f)
+        Ok(d)  =>
+            Ok(S3UploadDone { location: xmlfind.findtext(d.doc, d.root, "Location", ""),
+                              bucket: xmlfind.findtext(d.doc, d.root, "Bucket", ""),
+                              key: xmlfind.findtext(d.doc, d.root, "Key", ""),
+                              etag: xmlfind.findtext(d.doc, d.root, "ETag", "") })
 
 // A `ListPartsResult`.
 pub fn list_parts(body: Bytes) -> Result<[S3PartInfo], S3Fault> []
-    todo("s3-nv.s3xml.list_parts")
+    match open_doc(body, "ListPartsResult")
+        Err(f) => Err(f)
+        Ok(d)  =>
+            var out: [S3PartInfo] = []
+            for p in xmlfind.findall(d.doc, d.root, "Part")
+                out = list.concat(out, [S3PartInfo {
+                    part_number: str.to_int(xmlfind.findtext(d.doc, p, "PartNumber", "0")) ?? 0,
+                    etag: xmlfind.findtext(d.doc, p, "ETag", ""),
+                    size: str.to_int(xmlfind.findtext(d.doc, p, "Size", "0")) ?? 0,
+                    last_modified: xmlfind.findtext(d.doc, p, "LastModified", "") }])
+            Ok(out)
 
 // Whether a `ListPartsResult` says there are more parts.
 pub fn parts_truncated(body: Bytes) -> Result<Bool, S3Fault> []
-    todo("s3-nv.s3xml.parts_truncated")
+    match open_doc(body, "ListPartsResult")
+        Err(f) => Err(f)
+        Ok(d)  => Ok(xmlfind.findtext(d.doc, d.root, "IsTruncated", "false") == "true")
 
 // A `DeleteResult` from a batch delete.
 //
@@ -164,11 +304,27 @@ pub fn parts_truncated(body: Bytes) -> Result<Bool, S3Fault> []
 // the status concluded that a thousand objects were removed when
 // nine hundred were.
 pub fn delete_result(body: Bytes) -> Result<[S3DeleteOutcome], S3Fault> []
-    todo("s3-nv.s3xml.delete_result")
+    match open_doc(body, "DeleteResult")
+        Err(f) => Err(f)
+        Ok(d)  =>
+            var out: [S3DeleteOutcome] = []
+            for c in xmltree.element_children(d.doc, d.root)
+                let tag = xmltree.tag_of(d.doc, c)
+                if tag == "Deleted"
+                    out = list.concat(out, [S3DeleteOutcome { key: xmlfind.findtext(d.doc, c, "Key", ""),
+                                                              code: "", message: "" }])
+                else if tag == "Error"
+                    out = list.concat(out, [S3DeleteOutcome {
+                        key: xmlfind.findtext(d.doc, c, "Key", ""),
+                        code: xmlfind.findtext(d.doc, c, "Code", ""),
+                        message: xmlfind.findtext(d.doc, c, "Message", "") }])
+            Ok(out)
 
 // A `CopyObjectResult`, which carries the new ETag.
 pub fn copy_result(body: Bytes) -> Result<Str, S3Fault> []
-    todo("s3-nv.s3xml.copy_result")
+    match open_doc_or_error(body, "CopyObjectResult")
+        Err(f) => Err(f)
+        Ok(d)  => Ok(xmlfind.findtext(d.doc, d.root, "ETag", ""))
 
 // The `CompleteMultipartUpload` request document.
 //
@@ -177,7 +333,11 @@ pub fn copy_result(body: Bytes) -> Result<Str, S3Fault> []
 // readers it has to agree with.  The parts must be in ascending
 // order; `s3mpu.completion` is what sorts them.
 pub fn write_completion(parts: [S3PartInfo]) -> Bytes []
-    todo("s3-nv.s3xml.write_completion")
+    var s = "<CompleteMultipartUpload>"
+    for p in parts
+        s = s + "<Part><PartNumber>" + str.from_int(p.part_number) + "</PartNumber><ETag>"
+            + escape(p.etag) + "</ETag></Part>"
+    bytes.from_str(s + "</CompleteMultipartUpload>")
 
 // The `Delete` request document for a batch delete.
 //
@@ -185,7 +345,12 @@ pub fn write_completion(parts: [S3PartInfo]) -> Bytes []
 // thousand-key delete is the difference between a reply worth reading
 // and one that is mostly noise.
 pub fn write_delete(keys: [Str], quiet: Bool) -> Bytes []
-    todo("s3-nv.s3xml.write_delete")
+    var s = "<Delete>"
+    if quiet
+        s = s + "<Quiet>true</Quiet>"
+    for k in keys
+        s = s + "<Object><Key>" + escape(k) + "</Key></Object>"
+    bytes.from_str(s + "</Delete>")
 
 // The `CreateBucketConfiguration` document.
 //
@@ -195,4 +360,9 @@ pub fn write_delete(keys: [Str], quiet: Bool) -> Bytes []
 // client that always wrote it cannot create a bucket in the oldest
 // region.
 pub fn write_bucket_config(region: Str) -> Bytes []
-    todo("s3-nv.s3xml.write_bucket_config")
+    if region == "us-east-1" or region == ""
+        bytes.zeros(0)
+    else
+        bytes.from_str("<CreateBucketConfiguration xmlns=\"" + S3_XML_NAMESPACE
+                       + "\"><LocationConstraint>" + escape(region)
+                       + "</LocationConstraint></CreateBucketConfiguration>")

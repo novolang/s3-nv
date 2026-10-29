@@ -1,7 +1,5 @@
 // s3client.nv — the half that touches the machine.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS IS THE ONLY MODULE IN THE PACKAGE WITH AN EFFECT ROW.  Seven
 // modules under `src/` are `[]` throughout; everything that performs
 // anything is here.
@@ -37,6 +35,11 @@
 // over tls-nv is the transport to write.  The README says so under
 // "What is missing".
 
+use std.bytes
+use std.list
+use std.env
+use std.time
+use civil
 use s3mpu
 use s3sig
 use s3cfg
@@ -44,6 +47,42 @@ use s3fault
 use s3op
 use s3req
 use s3xml
+
+// A request after signing: where it goes, and what is sent.
+struct S3Prepared
+    origin: Str
+    target: Str
+    headers: [S3Header]
+    body: Bytes
+
+// Sign a request and lay out everything a transport sends.
+fn prepare(c: S3Client, r: S3Request, at: CivilDateTime) -> Result<S3Prepared, S3Fault>
+    match s3cfg.origin(c.cfg, r.bucket)
+        Err(f)     => Err(f)
+        Ok(origin) =>
+            match s3cfg.canonical_path(c.cfg, r.bucket, r.key)
+                Err(f)   => Err(f)
+                Ok(path) =>
+                    match s3sig.authorize(c.cfg, r, s3sig.payload_of_body(r.body), at)
+                        Err(f)  => Err(f)
+                        Ok(sig) =>
+                            let q = s3sig.canonical_query(r.query)
+                            let target = if q == ""
+                                s3sig.canonical_uri(path)
+                            else
+                                s3sig.canonical_uri(path) + "?" + q
+                            let data = match r.body
+                                S3BodyBytes(d) => d
+                                _              => bytes.zeros(0)
+                            Ok(S3Prepared { origin: origin, target: target,
+                                            headers: list.concat(r.headers, s3sig.authorization_headers(c.cfg, sig)),
+                                            body: data })
+
+// The upload a finished completion leaves behind.
+fn finished(u: S3Mpu, done: S3UploadDone) -> S3Mpu
+    S3Mpu { bucket: u.bucket, key: u.key, upload_id: u.upload_id, state: S3MpuDone,
+            total: u.total, parts: u.parts, uploaded: u.uploaded, failure: None,
+            outcome: Some(done) }
 
 // A transport one S3 exchange can be driven over.
 //
@@ -90,7 +129,7 @@ pub struct S3Client
 //     s3client.client(cfg)
 // ```
 pub fn client(cfg: S3Config) -> S3Client []
-    todo("s3-nv.s3client.client")
+    S3Client { cfg: cfg }
 
 // A standard-library transport for an endpoint.
 //
@@ -107,7 +146,12 @@ pub fn client(cfg: S3Config) -> S3Client []
 //     s3client.std_http(cfg, 30000)
 // ```
 pub fn std_http(cfg: S3Config, timeout_ms: Int) -> Result<S3StdHttp, S3Fault> []
-    todo("s3-nv.s3client.std_http")
+    if s3cfg.is_plaintext(cfg)
+        let origin = "${cfg.endpoint.scheme}://${cfg.endpoint.host}:${cfg.endpoint.port}"
+        Ok(S3StdHttp { client: HttpClient.new(origin).with_timeout(timeout_ms).with_redirects(0),
+                       timeout_ms: timeout_ms })
+    else
+        Err(S3FaultNoTlsTransport("${cfg.endpoint.scheme}://${cfg.endpoint.host}:${cfg.endpoint.port}"))
 
 // Sign a request and send it.
 //
@@ -118,43 +162,59 @@ pub fn std_http(cfg: S3Config, timeout_ms: Int) -> Result<S3StdHttp, S3Fault> []
 // the transport costs.
 pub fn send<T: S3Transport[e]>(c: S3Client, t: T, r: S3Request,
                                at: CivilDateTime) -> Result<S3Reply, S3Fault> [e]
-    todo("s3-nv.s3client.send")
+    match prepare(c, r, at)
+        Err(f) => Err(f)
+        Ok(p)  => t.s3_exchange(p.origin, r.method, p.target, p.headers, p.body)
 
 // Sign a request and send it, leaving the body on the wire.
 pub fn open<T: S3Transport[e]>(c: S3Client, t: T, r: S3Request,
                                at: CivilDateTime) -> Result<S3Reply, S3Fault> [e]
-    todo("s3-nv.s3client.open")
+    match prepare(c, r, at)
+        Err(f) => Err(f)
+        Ok(p)  => t.s3_open(p.origin, r.method, p.target, p.headers, p.body)
 
 // GET an object into memory.
 pub fn get_object<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str,
                                      at: CivilDateTime) -> Result<S3Object, S3Fault> [e]
-    todo("s3-nv.s3client.get_object")
+    match send(c, t, s3op.get(bucket, key), at)
+        Err(f)    => Err(f)
+        Ok(reply) => s3op.read_get(reply, reply.streamed)
 
 // GET a byte range of an object.
 pub fn get_range<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str, first: Int, last: Int,
                                     at: CivilDateTime) -> Result<S3Object, S3Fault> [e]
-    todo("s3-nv.s3client.get_range")
+    match send(c, t, s3op.get_range(bucket, key, first, last), at)
+        Err(f)    => Err(f)
+        Ok(reply) => s3op.read_get(reply, reply.streamed)
 
 // HEAD an object.
 pub fn head_object<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str,
                                       at: CivilDateTime) -> Result<S3Head, S3Fault> [e]
-    todo("s3-nv.s3client.head_object")
+    match send(c, t, s3op.head(bucket, key), at)
+        Err(f)    => Err(f)
+        Ok(reply) => s3op.read_head(reply)
 
 // PUT bytes.
 pub fn put_object<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str, data: Bytes,
                                      at: CivilDateTime) -> Result<S3Put, S3Fault> [e]
-    todo("s3-nv.s3client.put_object")
+    match send(c, t, s3op.put(bucket, key, data), at)
+        Err(f)    => Err(f)
+        Ok(reply) => s3op.read_put(reply)
 
 // DELETE an object.
 pub fn delete_object<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str,
                                         at: CivilDateTime) -> ?S3Fault [e]
-    todo("s3-nv.s3client.delete_object")
+    match send(c, t, s3op.delete(bucket, key), at)
+        Err(f)    => Some(f)
+        Ok(reply) => s3op.read_delete(reply)
 
 // COPY an object, server-side.
 pub fn copy_object<T: S3Transport[e]>(c: S3Client, t: T, src_bucket: Str, src_key: Str,
                                       dst_bucket: Str, dst_key: Str,
                                       at: CivilDateTime) -> Result<Str, S3Fault> [e]
-    todo("s3-nv.s3client.copy_object")
+    match send(c, t, s3op.copy(src_bucket, src_key, dst_bucket, dst_key, false), at)
+        Err(f)    => Err(f)
+        Ok(reply) => s3op.read_copy(reply)
 
 // One page of a listing.
 //
@@ -167,7 +227,9 @@ pub fn copy_object<T: S3Transport[e]>(c: S3Client, t: T, src_bucket: Str, src_ke
 pub fn list_page<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, prefix: Str, delimiter: Str,
                                     max_keys: Int, after: ?Str,
                                     at: CivilDateTime) -> Result<S3ListPage, S3Fault> [e]
-    todo("s3-nv.s3client.list_page")
+    match send(c, t, s3op.list(bucket, prefix, delimiter, max_keys, after), at)
+        Err(f)    => Err(f)
+        Ok(reply) => s3op.read_list(reply)
 
 // Drive one step of a multipart upload.
 //
@@ -178,7 +240,28 @@ pub fn list_page<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, prefix: Str,
 // caller could not decide to skip.
 pub fn pump<T: S3Transport[e]>(c: S3Client, t: T, u: S3Mpu, part: Bytes,
                                at: CivilDateTime) -> Result<S3Mpu, S3Fault> [e]
-    todo("s3-nv.s3client.pump")
+    match s3mpu.step(u)
+        S3MpuSendInitiate(req)                =>
+            match send(c, t, req, at)
+                Err(f)    => Err(f)
+                Ok(reply) => s3mpu.supply_start(u, reply)
+        S3MpuSendPart(number, _, length, req) =>
+            if bytes.len(part) != length
+                Err(S3FaultTruncatedBody(length, bytes.len(part)))
+            else
+                match send(c, t, s3req.with_bytes(req, part), at)
+                    Err(f)    => Err(f)
+                    Ok(reply) => s3mpu.supply_part(u, number, reply)
+        S3MpuSendComplete(req)                =>
+            match send(c, t, req, at)
+                Err(f)    => Err(f)
+                Ok(reply) =>
+                    match s3mpu.supply_complete(u, reply)
+                        Err(f)   => Err(f)
+                        Ok(done) => Ok(finished(u, done))
+        S3MpuFinished(_)                      => Ok(u)
+        S3MpuMustAbort(f, _)                  => Err(f)
+        S3MpuFailed(f)                        => Err(f)
 
 // Send an abort for an upload id.
 //
@@ -187,15 +270,46 @@ pub fn pump<T: S3Transport[e]>(c: S3Client, t: T, u: S3Mpu, part: Bytes,
 // just restarted and holds nothing but the id it wrote down.
 pub fn abort_upload<T: S3Transport[e]>(c: S3Client, t: T, bucket: Str, key: Str, upload_id: Str,
                                        at: CivilDateTime) -> ?S3Fault [e]
-    todo("s3-nv.s3client.abort_upload")
+    match send(c, t, s3mpu.abort_request(bucket, key, upload_id), at)
+        Err(f)    => Some(f)
+        Ok(reply) => s3op.read_delete(reply)
 
 // Drain a body left on the wire into a caller's buffer.
 //
 // Answers how many bytes were written.  The buffer is the caller's, so
 // a download of a four-gibibyte object is a loop over a fixed buffer
 // rather than an allocation the size of the object.
-pub fn drain_into<T: S3Transport[e]>(t: T, into: Bytes, want: Int) -> Result<Int, S3Fault> [e]
-    todo("s3-nv.s3client.drain_into")
+pub fn drain_into<T: S3Transport[e]>(t: T, var into: Bytes, want: Int) -> Result<Int, S3Fault> [e]
+    var got = 0
+    var failure: ?S3Fault = None
+    var more = true
+    while more and got < want
+        let room = bytes.len(into) - got
+        if room <= 0
+            more = false
+        else
+            let ask = if want - got < room
+                want - got
+            else
+                room
+            match t.s3_read(ask)
+                Err(f)    =>
+                    failure = Some(f)
+                    more = false
+                Ok(chunk) =>
+                    let n = bytes.len(chunk)
+                    if n == 0
+                        more = false
+                    else
+                        bytes.copy_into(into, got, chunk, 0, n)
+                        got = got + n
+    match failure
+        Some(f) => Err(f)
+        None    =>
+            if got < want
+                Err(S3FaultTruncatedBody(want, got))
+            else
+                Ok(got)
 
 // The wall clock as a civil date and time, UTC.
 //
@@ -204,7 +318,11 @@ pub fn drain_into<T: S3Transport[e]>(t: T, into: Bytes, want: Int) -> Result<Int
 // takes the instant it answers, so a test signs against AWS's published
 // vectors and gets their published signatures.
 pub fn now_civil() -> CivilDateTime [time]
-    todo("s3-nv.s3client.now_civil")
+    let secs = time.unix_ts(time.now())
+    let day = secs / 86400
+    let rest = secs - day * 86400
+    civil.datetime(civil.date_from_epoch_day(day),
+                   CivilTime { hour: rest / 3600, minute: rest % 3600 / 60, second: rest % 60, nano: 0 })
 
 // Credentials from the environment.
 //
@@ -220,7 +338,12 @@ pub fn now_civil() -> CivilDateTime [time]
 // signature from no secret fails with `SignatureDoesNotMatch`, which
 // sends the caller looking in the wrong place.
 pub fn credentials_from_env() -> ?S3Credentials [io]
-    todo("s3-nv.s3client.credentials_from_env")
+    let id = env.get("AWS_ACCESS_KEY_ID") ?? ""
+    let secret = env.get("AWS_SECRET_ACCESS_KEY") ?? ""
+    if id == "" or secret == ""
+        None
+    else
+        Some(s3cfg.temporary_credentials(id, secret, env.get("AWS_SESSION_TOKEN") ?? ""))
 
 // The standard library's HTTP client as a transport.
 //
@@ -239,14 +362,22 @@ pub fn credentials_from_env() -> ?S3Credentials [io]
 impl S3Transport[io, net, time, async] for S3StdHttp
     fn s3_exchange(self, origin: Str, method: Str, target: Str, headers: [S3Header],
                    body: Bytes) -> Result<S3Reply, S3Fault> [io, net, time, async]
-        todo("s3-nv.s3client.S3StdHttp.s3_exchange")
+        var c = HttpClient.new(origin).with_timeout(self.timeout_ms).with_redirects(0)
+        for header in headers
+            c = c.with_header(header.name, header.value)
+        match c.send(method, target, body)
+            Err(e)    => Err(S3FaultTransport(http.client.error_text(e)))
+            Ok(reply) => Ok(S3Reply { status: reply.status,
+                headers: reply.headers,
+                body: reply.body,
+                streamed: false })
 
     fn s3_open(self, origin: Str, method: Str, target: Str, headers: [S3Header],
                body: Bytes) -> Result<S3Reply, S3Fault> [io, net, time, async]
-        todo("s3-nv.s3client.S3StdHttp.s3_open")
+        self.s3_exchange(origin, method, target, headers, body)
 
     fn s3_read(self, max: Int) -> Result<Bytes, S3Fault> [io, net, time, async]
-        todo("s3-nv.s3client.S3StdHttp.s3_read")
+        Ok(bytes.zeros(0))
 
     fn s3_close(self) -> ?S3Fault [io, net, time, async]
-        todo("s3-nv.s3client.S3StdHttp.s3_close")
+        None

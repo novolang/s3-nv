@@ -1,8 +1,6 @@
 // s3req.nv — a request and a reply as values, before anything sends
 // either.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  A request is built, a reply is read, and neither
 // touches a socket.  That is what lets `tests/s3sig_tests.nv` drive
 // AWS's own published SigV4 test vectors with no network at all.
@@ -24,6 +22,19 @@
 // canonicalisation rule joins differently.  `s3sig.canonical_headers`
 // does the whole normalisation once, where it can be compared against
 // the specification's own worked examples.
+
+use std.bytes
+use std.list
+use std.str
+use mimeext
+
+// Split a `Name: value` line at its first colon.  A line with no colon
+// is not a header, and the status line of a reply is such a line.
+fn split_header(line: Str) -> ?S3Header
+    match str.index(line, ":")
+        None    => None
+        Some(i) => Some(S3Header { name: str.trim(str.slice(line, 0, i)),
+                                   value: str.trim(str.slice(line, i + 1, str.len(line))) })
 
 // One header, as it will be sent.
 //
@@ -93,23 +104,28 @@ pub struct S3Reply
 
 // A GET-shaped request with no body.
 pub fn request(method: Str, bucket: Str, key: Str) -> S3Request []
-    todo("s3-nv.s3req.request")
+    S3Request { method: method, bucket: bucket, key: key, query: [], headers: [], body: S3BodyNone }
 
 // The same request with one more query parameter.
 pub fn with_query(r: S3Request, name: Str, value: Str) -> S3Request []
-    todo("s3-nv.s3req.with_query")
+    S3Request { method: r.method, bucket: r.bucket, key: r.key,
+                query: list.concat(r.query, [S3QueryPair { name: name, value: value }]),
+                headers: r.headers, body: r.body }
 
 // The same request with one more header.
 pub fn with_header(r: S3Request, name: Str, value: Str) -> S3Request []
-    todo("s3-nv.s3req.with_header")
+    S3Request { method: r.method, bucket: r.bucket, key: r.key, query: r.query,
+                headers: list.concat(r.headers, [S3Header { name: name, value: value }]),
+                body: r.body }
 
 // The same request carrying a body.
 pub fn with_body(r: S3Request, body: S3Body) -> S3Request []
-    todo("s3-nv.s3req.with_body")
+    S3Request { method: r.method, bucket: r.bucket, key: r.key, query: r.query,
+                headers: r.headers, body: body }
 
 // The same request carrying bytes.
 pub fn with_bytes(r: S3Request, data: Bytes) -> S3Request []
-    todo("s3-nv.s3req.with_bytes")
+    with_body(r, S3BodyBytes(data))
 
 // How many bytes a body will send.
 //
@@ -117,7 +133,11 @@ pub fn with_bytes(r: S3Request, data: Bytes) -> S3Request []
 // an empty object needs — and an empty object is a thing S3 stores and
 // a thing a directory-marker convention depends on.
 pub fn body_length(b: S3Body) -> Int []
-    todo("s3-nv.s3req.body_length")
+    match b
+        S3BodyNone                     => 0
+        S3BodyBytes(data)              => bytes.len(data)
+        S3BodyStreamed(length, _)      => length
+        S3BodyStreamedUnhashed(length) => length
 
 // One header's value, matched without regard to case.
 //
@@ -133,11 +153,23 @@ pub fn body_length(b: S3Body) -> Int []
 //     s3req.header_of(h, "etag")
 // ```
 pub fn header_of(headers: [Str], name: Str) -> ?Str []
-    todo("s3-nv.s3req.header_of")
+    let want = str.lower(name)
+    var found: ?Str = None
+    for line in headers
+        if found == None
+            if let Some(p) = split_header(line)
+                if str.lower(p.name) == want
+                    found = Some(p.value)
+    found
 
 // One header's value off a request's own list.
 pub fn request_header_of(r: S3Request, name: Str) -> ?Str []
-    todo("s3-nv.s3req.request_header_of")
+    let want = str.lower(name)
+    var found: ?Str = None
+    for h in r.headers
+        if found == None and str.lower(h.name) == want
+            found = Some(h.value)
+    found
 
 // The `Range` header for a byte range, inclusive at both ends.
 //
@@ -145,11 +177,11 @@ pub fn request_header_of(r: S3Request, name: Str) -> ?Str []
 // interval is HTTP's rather than this package's choice — a half-open
 // spelling here would be one translation nobody remembers to do.
 pub fn range_header(first: Int, last: Int) -> Str []
-    todo("s3-nv.s3req.range_header")
+    "bytes=${first}-${last}"
 
 // The `Range` header for everything from an offset onwards.
 pub fn range_from(first: Int) -> Str []
-    todo("s3-nv.s3req.range_from")
+    "bytes=${first}-"
 
 // The `Range` header for the last `n` bytes.
 //
@@ -157,7 +189,7 @@ pub fn range_from(first: Int) -> Str []
 // is a suffix and the second is an offset, and the two differ by one
 // character in a header that nothing validates.
 pub fn range_suffix(n: Int) -> Str []
-    todo("s3-nv.s3req.range_suffix")
+    "bytes=-${n}"
 
 // The three numbers a `Content-Range` reply header carries.
 //
@@ -167,7 +199,33 @@ pub fn range_suffix(n: Int) -> Str []
 // is the length of the RANGE, and a resumer that read it concludes the
 // object is five hundred bytes long.
 pub fn content_range_of(headers: [Str]) -> ?(Int, Int, Int) []
-    todo("s3-nv.s3req.content_range_of")
+    match header_of(headers, "content-range")
+        None    => None
+        Some(v) =>
+            if not str.starts_with(v, "bytes ")
+                None
+            else
+                let rest = str.slice(v, 6, str.len(v))
+                let halves = str.split(rest, "/")
+                if list.len(halves) != 2
+                    None
+                else
+                    let span = str.split(list.get(halves, 0), "-")
+                    if list.len(span) != 2
+                        None
+                    else
+                        let first = str.to_int(str.trim(list.get(span, 0)))
+                        let last = str.to_int(str.trim(list.get(span, 1)))
+                        let total = str.to_int(str.trim(list.get(halves, 1)))
+                        match first
+                            Some(f) =>
+                                match last
+                                    Some(l) =>
+                                        match total
+                                            Some(t) => Some((f, l, t))
+                                            None    => None
+                                    None    => None
+                            None    => None
 
 // A `Content-Type` for a key, from its extension.
 //
@@ -177,7 +235,11 @@ pub fn content_range_of(headers: [Str]) -> ?(Int, Int, Int) []
 // one serves a website that downloads its own pages instead of
 // rendering them — and fixing it afterwards is a copy of every object.
 pub fn content_type_for(key: Str) -> Str []
-    todo("s3-nv.s3req.content_type_for")
+    let found = mimeext.type_for_name(key)
+    if found == ""
+        "application/octet-stream"
+    else
+        found
 
 // A user metadata header, `x-amz-meta-<name>`.
 //
@@ -185,18 +247,28 @@ pub fn content_type_for(key: Str) -> Str []
 // keys on the way out and a caller that stored `Author` and read back
 // `author` has a round trip that silently does not round-trip.
 pub fn metadata_header(name: Str, value: Str) -> S3Header []
-    todo("s3-nv.s3req.metadata_header")
+    S3Header { name: "x-amz-meta-" + str.lower(name), value: value }
 
 // Every `x-amz-meta-` header in a reply, with the prefix removed.
 pub fn metadata_of(headers: [Str]) -> [S3Header] []
-    todo("s3-nv.s3req.metadata_of")
+    var out: [S3Header] = []
+    for line in headers
+        if let Some(p) = split_header(line)
+            let lower = str.lower(p.name)
+            if str.starts_with(lower, "x-amz-meta-")
+                out = list.concat(out, [S3Header { name: str.slice(lower, 11, str.len(lower)),
+                                                   value: p.value }])
+    out
 
 // Whether a metadata set fits S3's two-kilobyte ceiling.
 //
 // The ceiling counts the names AND the values AND the separators, and
 // exceeding it is a 400 at PUT time — after the body has been sent.
 pub fn metadata_fits(meta: [S3Header]) -> Bool []
-    todo("s3-nv.s3req.metadata_fits")
+    var total = 0
+    for h in meta
+        total = total + str.len(h.name) + str.len(h.value) + 2
+    total <= 2048
 
 // The `If-Match` header, for a conditional write.
 //
@@ -205,8 +277,8 @@ pub fn metadata_fits(meta: [S3Header]) -> Bool []
 // winning silently.  Not every S3-compatible service honours it, and
 // `s3op.conditional_writes_supported` is the one that says so.
 pub fn if_match_header(etag: Str) -> S3Header []
-    todo("s3-nv.s3req.if_match_header")
+    S3Header { name: "If-Match", value: etag }
 
 // The `If-None-Match: *` header, for a write that must not replace.
 pub fn if_none_match_any() -> S3Header []
-    todo("s3-nv.s3req.if_none_match_any")
+    S3Header { name: "If-None-Match", value: "*" }

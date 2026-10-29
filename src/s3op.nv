@@ -1,7 +1,5 @@
 // s3op.nv — the operations, as request values and reply readers.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  Every function here either builds an `S3Request`
 // or reads an `S3Reply`.  Nothing sends anything, which is what lets a
 // caller with its own HTTP stack use this package for everything except
@@ -19,10 +17,20 @@
 // objects is four thousand round trips, and a caller that cannot see
 // them cannot stop, checkpoint or rate-limit them.
 
+use std.bytes
+use std.list
+use std.str
+use hashing
+use xmltree
 use s3req
 use s3cfg
 use s3fault
+use s3sig
 use s3xml
+
+// A reply header's value, or a default when the reply has none.
+fn header_or(r: S3Reply, name: Str, fallback: Str) -> Str
+    s3req.header_of(r.headers, name) ?? fallback
 
 // The floor S3 puts on every multipart part but the last: five
 // mebibytes.  Named here rather than in `s3mpu` because `put` is where
@@ -89,15 +97,15 @@ pub struct S3Put
 //     s3op.get(b, k)
 // ```
 pub fn get(bucket: Str, key: Str) -> S3Request []
-    todo("s3-nv.s3op.get")
+    s3req.request("GET", bucket, key)
 
 // A GET of a byte range.
 pub fn get_range(bucket: Str, key: Str, first: Int, last: Int) -> S3Request []
-    todo("s3-nv.s3op.get_range")
+    s3req.with_header(get(bucket, key), "Range", s3req.range_header(first, last))
 
 // A GET that answers 304 when the caller's copy is still current.
 pub fn get_if_none_match(bucket: Str, key: Str, etag: Str) -> S3Request []
-    todo("s3-nv.s3op.get_if_none_match")
+    s3req.with_header(get(bucket, key), "If-None-Match", etag)
 
 // Read a GET's reply.
 //
@@ -106,7 +114,25 @@ pub fn get_if_none_match(bucket: Str, key: Str, etag: Str) -> S3Request []
 // The flag is an argument rather than read off the reply because it is
 // the TRANSPORT's property and not the service's.
 pub fn read_get(r: S3Reply, streamed: Bool) -> Result<S3Object, S3Fault> []
-    todo("s3-nv.s3op.read_get")
+    if r.status < 200 or r.status > 299
+        Err(fault_of_reply(r))
+    else
+        let got = bytes.len(r.body)
+        let want = str.to_int(header_or(r, "content-length", "")) ?? got
+        if not streamed and want > got
+            Err(S3FaultTruncatedBody(want, got))
+        else
+            let body = if streamed
+                bytes.zeros(0)
+            else
+                r.body
+            Ok(S3Object { body: body, etag: header_or(r, "etag", ""),
+                          content_type: header_or(r, "content-type", ""),
+                          content_length: want,
+                          last_modified: header_or(r, "last-modified", ""),
+                          metadata: s3req.metadata_of(r.headers),
+                          content_range: s3req.content_range_of(r.headers),
+                          version_id: header_or(r, "x-amz-version-id", "") })
 
 // A HEAD of one object.
 //
@@ -116,11 +142,20 @@ pub fn read_get(r: S3Reply, streamed: Bool) -> Result<S3Object, S3Fault> []
 // are indistinguishable for an object the caller may not list: S3
 // answers 403 for both rather than confirming existence.
 pub fn head(bucket: Str, key: Str) -> S3Request []
-    todo("s3-nv.s3op.head")
+    s3req.request("HEAD", bucket, key)
 
 // Read a HEAD's reply.
 pub fn read_head(r: S3Reply) -> Result<S3Head, S3Fault> []
-    todo("s3-nv.s3op.read_head")
+    if r.status < 200 or r.status > 299
+        Err(fault_of_reply(r))
+    else
+        Ok(S3Head { etag: header_or(r, "etag", ""),
+                    content_type: header_or(r, "content-type", ""),
+                    content_length: str.to_int(header_or(r, "content-length", "")) ?? 0,
+                    last_modified: header_or(r, "last-modified", ""),
+                    metadata: s3req.metadata_of(r.headers),
+                    version_id: header_or(r, "x-amz-version-id", ""),
+                    storage_class: header_or(r, "x-amz-storage-class", "") })
 
 // A PUT of bytes the caller holds.
 //
@@ -128,15 +163,22 @@ pub fn read_head(r: S3Reply) -> Result<S3Head, S3Fault> []
 // adds none; see `s3req.content_type_for` for why that matters more
 // than it looks.
 pub fn put(bucket: Str, key: Str, data: Bytes) -> S3Request []
-    todo("s3-nv.s3op.put")
+    let base = s3req.with_header(s3req.request("PUT", bucket, key), "Content-Type",
+                                 s3req.content_type_for(key))
+    s3req.with_bytes(base, data)
 
 // A PUT of a body the caller will stream, whose hash it has.
 pub fn put_streamed(bucket: Str, key: Str, length: Int, sha256_hex: Str) -> S3Request []
-    todo("s3-nv.s3op.put_streamed")
+    let base = s3req.with_header(s3req.request("PUT", bucket, key), "Content-Type",
+                                 s3req.content_type_for(key))
+    s3req.with_body(base, S3BodyStreamed(length, sha256_hex))
 
 // Read a PUT's reply.
 pub fn read_put(r: S3Reply) -> Result<S3Put, S3Fault> []
-    todo("s3-nv.s3op.read_put")
+    if r.status < 200 or r.status > 299
+        Err(fault_of_reply(r))
+    else
+        Ok(S3Put { etag: header_or(r, "etag", ""), version_id: header_or(r, "x-amz-version-id", "") })
 
 // A DELETE of one object.
 //
@@ -145,15 +187,18 @@ pub fn read_put(r: S3Reply) -> Result<S3Put, S3Fault> []
 // cannot tell a caller whether anything was removed, and
 // `delete_if_match` is what a caller that needs to know uses.
 pub fn delete(bucket: Str, key: Str) -> S3Request []
-    todo("s3-nv.s3op.delete")
+    s3req.request("DELETE", bucket, key)
 
 // A DELETE conditional on the object's ETag.
 pub fn delete_if_match(bucket: Str, key: Str, etag: Str) -> S3Request []
-    todo("s3-nv.s3op.delete_if_match")
+    s3req.with_header(delete(bucket, key), "If-Match", etag)
 
 // Read a DELETE's reply.
 pub fn read_delete(r: S3Reply) -> ?S3Fault []
-    todo("s3-nv.s3op.read_delete")
+    if r.status >= 200 and r.status <= 299
+        None
+    else
+        Some(fault_of_reply(r))
 
 // A batch DELETE of up to a thousand keys.
 //
@@ -162,14 +207,35 @@ pub fn read_delete(r: S3Reply) -> ?S3Fault []
 // operation predates the content hash and the service still refuses a
 // batch delete without it.
 pub fn delete_many(bucket: Str, keys: [Str], quiet: Bool) -> Result<S3Request, S3Fault> []
-    todo("s3-nv.s3op.delete_many")
+    let n = list.len(keys)
+    if n < 1 or n > S3_DELETE_MAX_KEYS
+        Err(S3FaultBadKey("a batch delete names 1 to 1000 keys and this one names ${n}"))
+    else
+        var bad: ?Str = None
+        for k in keys
+            if bad == None and not s3cfg.key_ok(k)
+                bad = Some(k)
+        match bad
+            Some(k) => Err(S3FaultBadKey(k))
+            None    =>
+                let body = s3xml.write_delete(keys, quiet)
+                let md5 = bytes.to_base64(hashing.md5(body))
+                let r = s3req.with_header(s3req.with_header(s3req.with_query(s3req.request("POST", bucket, ""), "delete", ""),
+                                                            "Content-MD5", md5),
+                                          "Content-Type", "application/xml")
+                Ok(s3req.with_bytes(r, body))
 
 // Read a batch DELETE's reply.
 //
 // A 200 with failures inside it is the normal shape, so the answer is
 // every outcome and the caller decides.
 pub fn read_delete_many(r: S3Reply) -> Result<[S3DeleteOutcome], S3Fault> []
-    todo("s3-nv.s3op.read_delete_many")
+    if r.status < 200 or r.status > 299
+        Err(fault_of_reply(r))
+    else if body_is_error(r)
+        Err(S3FaultService(r.status, s3xml.error_doc(r.body)))
+    else
+        s3xml.delete_result(r.body)
 
 // One page of a listing.
 //
@@ -184,11 +250,29 @@ pub fn read_delete_many(r: S3Reply) -> Result<[S3DeleteOutcome], S3Fault> []
 //     s3op.list(b, p, "/", 1000, None)
 // ```
 pub fn list(bucket: Str, prefix: Str, delimiter: Str, max_keys: Int, after: ?Str) -> S3Request []
-    todo("s3-nv.s3op.list")
+    var r = s3req.with_query(s3req.with_query(s3req.request("GET", bucket, ""), "list-type", "2"),
+                             "encoding-type", "url")
+    if prefix != ""
+        r = s3req.with_query(r, "prefix", prefix)
+    if delimiter != ""
+        r = s3req.with_query(r, "delimiter", delimiter)
+    let cap = if max_keys < 1
+        1
+    else if max_keys > S3_LIST_MAX_KEYS
+        S3_LIST_MAX_KEYS
+    else
+        max_keys
+    r = s3req.with_query(r, "max-keys", str.from_int(cap))
+    match after
+        Some(token) => s3req.with_query(r, "continuation-token", token)
+        None        => r
 
 // Read a listing's reply.
 pub fn read_list(r: S3Reply) -> Result<S3ListPage, S3Fault> []
-    todo("s3-nv.s3op.read_list")
+    if r.status < 200 or r.status > 299
+        Err(fault_of_reply(r))
+    else
+        s3xml.list_result(r.body)
 
 // Whether a listing has another page.
 //
@@ -196,7 +280,7 @@ pub fn read_list(r: S3Reply) -> Result<S3ListPage, S3Fault> []
 // out gets it wrong: it is `is_truncated`, and it is never "the page
 // had entries".
 pub fn has_more(page: S3ListPage) -> Bool []
-    todo("s3-nv.s3op.has_more")
+    page.is_truncated
 
 // A server-side COPY.
 //
@@ -211,7 +295,13 @@ pub fn has_more(page: S3ListPage) -> Bool []
 // the copy keeps the source's or takes the request's.
 pub fn copy(src_bucket: Str, src_key: Str, dst_bucket: Str, dst_key: Str,
             replace_metadata: Bool) -> S3Request []
-    todo("s3-nv.s3op.copy")
+    let base = s3req.with_header(s3req.request("PUT", dst_bucket, dst_key), "x-amz-copy-source",
+                                 copy_source_header(src_bucket, src_key))
+    let directive = if replace_metadata
+        "REPLACE"
+    else
+        "COPY"
+    s3req.with_header(base, "x-amz-metadata-directive", directive)
 
 // Read a COPY's reply.
 //
@@ -220,20 +310,31 @@ pub fn copy(src_bucket: Str, src_key: Str, dst_bucket: Str, dst_key: Str,
 // and the status goes out first.  A caller that checked the status
 // reports a copy that did not happen.
 pub fn read_copy(r: S3Reply) -> Result<Str, S3Fault> []
-    todo("s3-nv.s3op.read_copy")
+    if r.status < 200 or r.status > 299
+        Err(fault_of_reply(r))
+    else
+        s3xml.copy_result(r.body)
 
 // The `x-amz-copy-source` value for a bucket and key.
 pub fn copy_source_header(bucket: Str, key: Str) -> Str []
-    todo("s3-nv.s3op.copy_source_header")
+    "/" + bucket + "/" + s3sig.canonical_uri(key)
 
 // A CreateBucket request.
 pub fn create_bucket(bucket: Str, region: Str) -> Result<S3Request, S3Fault> []
-    todo("s3-nv.s3op.create_bucket")
+    if not s3cfg.bucket_name_ok(bucket)
+        Err(S3FaultBadEndpoint("the bucket name is not one S3 accepts: ${bucket}"))
+    else
+        let body = s3xml.write_bucket_config(region)
+        let r = s3req.request("PUT", bucket, "")
+        if bytes.len(body) == 0
+            Ok(r)
+        else
+            Ok(s3req.with_header(s3req.with_bytes(r, body), "Content-Type", "application/xml"))
 
 // A HEAD of a bucket, which is how existence and access are asked
 // together.
 pub fn head_bucket(bucket: Str) -> S3Request []
-    todo("s3-nv.s3op.head_bucket")
+    s3req.request("HEAD", bucket, "")
 
 // Whether an ETag names a multipart object.
 //
@@ -251,15 +352,32 @@ pub fn head_bucket(bucket: Str) -> S3Request []
 //     s3op.etag_is_multipart(e)
 // ```
 pub fn etag_is_multipart(etag: Str) -> Bool []
-    todo("s3-nv.s3op.etag_is_multipart")
+    etag_part_count(etag) > 0
 
 // How many parts a multipart ETag names, or zero.
 pub fn etag_part_count(etag: Str) -> Int []
-    todo("s3-nv.s3op.etag_part_count")
+    let bare = etag_unquoted(etag)
+    match str.index(bare, "-")
+        None    => 0
+        Some(_) =>
+            let parts = str.split(bare, "-")
+            let tail = list.get(parts, list.len(parts) - 1)
+            if list.len(parts) == 2 and str.len(list.get(parts, 0)) == 32
+                str.to_int(tail) ?? 0
+            else
+                0
 
 // An ETag with its quotes removed, for a caller comparing two.
 pub fn etag_unquoted(etag: Str) -> Str []
-    todo("s3-nv.s3op.etag_unquoted")
+    let t = str.trim(etag)
+    let s = if str.starts_with(t, "W/")
+        str.slice(t, 2, str.len(t))
+    else
+        t
+    if str.len(s) >= 2 and str.starts_with(s, "\"") and str.ends_with(s, "\"")
+        str.slice(s, 1, str.len(s) - 1)
+    else
+        s
 
 // Whether a 200 reply is actually a failure document.
 //
@@ -268,14 +386,20 @@ pub fn etag_unquoted(etag: Str) -> Str []
 // because a caller draining the body itself has to make the same call
 // and there is exactly one right way to make it.
 pub fn body_is_error(r: S3Reply) -> Bool []
-    todo("s3-nv.s3op.body_is_error")
+    let doc = xmltree.build(bytes.to_str(r.body))
+    match xmltree.document_element(doc)
+        None       => false
+        Some(root) => xmltree.local_of(doc, root) == "Error"
 
 // The fault a non-2xx reply names.
 //
 // One function, so every `read_*` above reports the same way and a
 // service's `<Code>` reaches the caller whichever operation met it.
 pub fn fault_of_reply(r: S3Reply) -> S3Fault []
-    todo("s3-nv.s3op.fault_of_reply")
+    if bytes.len(r.body) == 0
+        S3FaultService(r.status, s3fault.empty_doc(r.status))
+    else
+        S3FaultService(r.status, s3xml.error_doc(r.body))
 
 // Whether conditional writes are worth attempting against a service.
 //
@@ -286,4 +410,7 @@ pub fn fault_of_reply(r: S3Reply) -> S3Fault []
 // is no way to ask a service; this answers what the endpoint is known
 // to do, and `None` is an honest third answer.
 pub fn conditional_writes_supported(cfg: S3Config) -> ?Bool []
-    todo("s3-nv.s3op.conditional_writes_supported")
+    if str.ends_with(cfg.endpoint.host, ".amazonaws.com") or cfg.endpoint.host == "s3.amazonaws.com"
+        Some(true)
+    else
+        None

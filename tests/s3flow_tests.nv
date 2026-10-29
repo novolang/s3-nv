@@ -1,9 +1,6 @@
 // s3flow_tests.nv — the operations, the listing loop, the multipart
 // state machine and the transport that crosses the layer.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: s3-nv.<module>.<fn>`.
-//
 // THE TRANSPORT BELOW IS `[]` AND IT IS THE CLAIM THIS FILE EXISTS TO
 // CHECK.  `S3TestTape` implements `S3Transport[]` over a recorded
 // exchange, and the function that drives it carries no effect row at

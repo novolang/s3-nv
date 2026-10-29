@@ -5,6 +5,64 @@ All notable changes to s3-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-10-29
+
+Every body is written.  The package is an S3 client: Signature Version 4,
+presigned URLs, the operations, the listing loop, the multipart state
+machine and a transport over the standard library's HTTP client.
+
+- **The signatures are AWS's.**  Five published SigV4 examples reproduce
+  exactly: the `GET` with a `Range` header, the `PUT` of
+  `test$file.text`, `GET ?lifecycle`, `GET ?max-keys=2&prefix=J` and the
+  presigned `GET`.  Percent-encoding is spelled out in `s3sig` and not
+  taken from url-nv, whose `PctSet` leaves `!'()*` alone and SigV4
+  encodes them.
+- `s3cfg.aws("us-east-1", …)` is host `s3.amazonaws.com`, the spelling
+  AWS's own examples sign; every other region is `s3.<region>.amazonaws.com`.
+- A `HEAD` that fails has no body, so its fault carries an empty
+  document; `s3fault.is_no_such_key` counts an empty-bodied 404 as a
+  missing key.
+- The dependency ranges move to the implemented releases: xml-nv `^0.1.1`,
+  url-nv `^0.1.4`, mime-nv `^0.1.1`, calendar-nv `^0.2.1`.
+
+### Changed
+
+- `s3sig.signing_key` takes `var out: Bytes` and `s3client.drain_into`
+  takes `var into: Bytes`.  Both always wrote into the caller's buffer;
+  the compiler now requires the parameter to say so (E2036, E2050).
+  Callers that pass a fresh buffer write `var buf` at the call.
+- `S3Mpu` gains two fields, `failure: ?S3Fault` and
+  `outcome: ?S3UploadDone`.  `s3mpu.fail` answers an `S3Mpu` and
+  `s3client.pump` answers an `S3Mpu` after the completion, and neither
+  had anywhere to put the failure or the completion's ETag.  Nobody
+  outside the package builds an `S3Mpu` by hand, so no caller breaks.
+- `s3sig.authorization_headers` answers `x-amz-date`,
+  `x-amz-content-sha256`, `x-amz-security-token` when there is one, and
+  `Authorization`.  It does not answer `Host`: the signature covers the
+  host that `s3cfg.host_header` names, and the transport sets `Host`
+  from the origin `s3cfg.origin` names.
+
+### Known
+
+- `s3client.std_http` still refuses an `https` endpoint, as the
+  published tests require.  The standard library documents `https` for
+  every verb in toolchain 0.22; this release has not tried it.
+- The shipped transport buffers an `s3_open` reply: its `s3_read`
+  answers an empty body and the reply carries the whole of it.  A
+  transport that is a copyable struct cannot keep a connection open
+  between two calls.
+- `s3op.conditional_writes_supported` answers `Some(true)` for AWS hosts
+  and `None` for every other endpoint; no table of compatible services
+  was checked.
+- `s3op.delete_many`, `s3mpu` and `s3sig.presign` refuse a bad argument
+  with the nearest existing fault (`S3FaultBadKey`, `S3FaultPartTooSmall`,
+  `S3FaultPresignTooLong`, or `S3FaultService` carrying `EntityTooLarge`,
+  `InvalidPart` or `NoSuchUpload`), because `S3Fault` has no variant for
+  them.
+- `s3sig.signing_key` refuses a buffer that is not 32 bytes with
+  `S3FaultBadEndpoint`, for the same reason.
+- The multipart reply to a `ListMultipartUploads` request has no reader.
+
 ## 0.0.4 — 2026-10-25
 
 A file that names a sibling module's type, function or constant now has the `use` line for that module (E2033, E2003).  No signature and no behaviour changed.

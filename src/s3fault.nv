@@ -1,7 +1,5 @@
 // s3fault.nv — what can go wrong, as values a caller holds.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT.  Nothing in this module reads, writes or waits.
 //
 // THE STATUS CODE IS NOT THE ANSWER, AND THIS IS THE MODULE THAT SAYS
@@ -158,11 +156,49 @@ pub enum S3Fault
 //         _           => false
 // ```
 pub fn code_of_text(code: Str) -> S3ErrorCode []
-    todo("s3-nv.s3fault.code_of_text")
+    match code
+        "NoSuchBucket"            => S3NoSuchBucket
+        "NoSuchKey"               => S3NoSuchKey
+        "NoSuchUpload"            => S3NoSuchUpload
+        "AccessDenied"            => S3AccessDenied
+        "SignatureDoesNotMatch"   => S3SignatureDoesNotMatch
+        "InvalidAccessKeyId"      => S3InvalidAccessKeyId
+        "RequestTimeTooSkewed"    => S3RequestTimeTooSkewed
+        "EntityTooSmall"          => S3EntityTooSmall
+        "EntityTooLarge"          => S3EntityTooLarge
+        "InvalidPart"             => S3InvalidPart
+        "InvalidPartOrder"        => S3InvalidPartOrder
+        "PreconditionFailed"      => S3PreconditionFailed
+        "SlowDown"                => S3SlowDown
+        "InternalError"           => S3InternalError
+        "BucketAlreadyOwnedByYou" => S3BucketAlreadyOwnedByYou
+        "InvalidBucketName"       => S3InvalidBucketName
+        "InvalidRange"            => S3InvalidRange
+        "MalformedXML"            => S3MalformedXml
+        _                         => S3OtherCode(code)
 
 // The string a code is written as on the wire.
 pub fn code_text(code: S3ErrorCode) -> Str []
-    todo("s3-nv.s3fault.code_text")
+    match code
+        S3NoSuchBucket            => "NoSuchBucket"
+        S3NoSuchKey               => "NoSuchKey"
+        S3NoSuchUpload            => "NoSuchUpload"
+        S3AccessDenied            => "AccessDenied"
+        S3SignatureDoesNotMatch   => "SignatureDoesNotMatch"
+        S3InvalidAccessKeyId      => "InvalidAccessKeyId"
+        S3RequestTimeTooSkewed    => "RequestTimeTooSkewed"
+        S3EntityTooSmall          => "EntityTooSmall"
+        S3EntityTooLarge          => "EntityTooLarge"
+        S3InvalidPart             => "InvalidPart"
+        S3InvalidPartOrder        => "InvalidPartOrder"
+        S3PreconditionFailed      => "PreconditionFailed"
+        S3SlowDown                => "SlowDown"
+        S3InternalError           => "InternalError"
+        S3BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou"
+        S3InvalidBucketName       => "InvalidBucketName"
+        S3InvalidRange            => "InvalidRange"
+        S3MalformedXml            => "MalformedXML"
+        S3OtherCode(c)            => c
 
 // Whether a code is worth sending again.
 //
@@ -179,7 +215,11 @@ pub fn code_text(code: S3ErrorCode) -> Str []
 //     s3fault.is_retryable(c)
 // ```
 pub fn is_retryable(code: S3ErrorCode) -> Bool []
-    todo("s3-nv.s3fault.is_retryable")
+    match code
+        S3SlowDown             => true
+        S3InternalError        => true
+        S3RequestTimeTooSkewed => true
+        _                      => false
 
 // Whether a fault is worth sending again, transport failures included.
 //
@@ -190,7 +230,14 @@ pub fn is_retryable(code: S3ErrorCode) -> Bool []
 // harmless — it is, for an object store, and it is not for a caller
 // that computed the key from a counter.
 pub fn fault_is_retryable(f: S3Fault, idempotent: Bool) -> Bool []
-    todo("s3-nv.s3fault.fault_is_retryable")
+    match f
+        S3FaultService(status, doc) =>
+            match doc.code
+                S3OtherCode(_) => status >= 500 and status != 501
+                c              => is_retryable(c)
+        S3FaultTransport(_)         => idempotent
+        S3FaultTruncatedBody(_, _)  => idempotent
+        _                           => false
 
 // The sentence that names the repair, or empty when there is none.
 //
@@ -203,14 +250,23 @@ pub fn fault_is_retryable(f: S3Fault, idempotent: Bool) -> Bool []
 // key that exists is a missing `s3:ListBucket`, which is why the same
 // account can GET the object and cannot HEAD it.
 pub fn fix_hint(doc: S3ErrorDoc) -> Str []
-    todo("s3-nv.s3fault.fix_hint")
+    match doc.code
+        S3SignatureDoesNotMatch => "the secret is rarely the cause: check that the addressing style matches the endpoint (path-style sent to a virtual-host endpoint, or the reverse) and that no character of the key was encoded twice"
+        S3RequestTimeTooSkewed  => "the clock is more than fifteen minutes from the service's: correct it with NTP and send the request again; the credentials are not at fault"
+        S3AccessDenied          => "a policy refused the request; on a HEAD of a key that exists this is usually a missing s3:ListBucket permission, and retrying will not change it"
+        S3InvalidAccessKeyId    => "the endpoint does not know this access key id: check the key and the endpoint's region"
+        S3NoSuchBucket          => "the bucket does not exist or is not visible to these credentials: check the name and the region"
+        S3EntityTooSmall        => "every multipart part but the last must be at least five mebibytes: plan the parts with s3mpu.plan_parts"
+        S3InvalidPartOrder      => "the completion list must be in ascending part order: build it with s3mpu.completion"
+        S3SlowDown              => "the prefix is being written faster than it partitions: back off and send again"
+        _                       => ""
 
 // An empty document, for a status that carried no body at all.
 //
 // A 304 and a HEAD's 404 have no body by definition, so the fault for
 // one is a `S3FaultService` over this rather than a parse failure.
 pub fn empty_doc(status: Int) -> S3ErrorDoc []
-    todo("s3-nv.s3fault.empty_doc")
+    S3ErrorDoc { code: S3OtherCode(""), message: "", resource: "", request_id: "", host_id: "" }
 
 // Whether a fault is a plain "the key is not there".
 //
@@ -225,7 +281,13 @@ pub fn empty_doc(status: Int) -> S3ErrorDoc []
 //     s3fault.is_no_such_key(f)
 // ```
 pub fn is_no_such_key(f: S3Fault) -> Bool []
-    todo("s3-nv.s3fault.is_no_such_key")
+    match f
+        S3FaultService(status, doc) =>
+            match doc.code
+                S3NoSuchKey    => true
+                S3OtherCode(c) => status == 404 and c == ""
+                _              => false
+        _                           => false
 
 // What went wrong, in one line.
 //
@@ -240,4 +302,22 @@ pub fn is_no_such_key(f: S3Fault) -> Bool []
 // ```
 impl Error for S3Fault
     fn message(self) -> Str
-        todo("s3-nv.s3fault.S3Fault.message")
+        match self
+            S3FaultService(status, doc)            =>
+                "s3: the service answered ${status} ${code_text(doc.code)}: ${doc.message}"
+            S3FaultTransport(detail)               => "s3: the transport failed: ${detail}"
+            S3FaultBadEndpoint(detail)             => "s3: the endpoint is not usable: ${detail}"
+            S3FaultUnsignedOverPlaintext(endpoint) =>
+                "s3: an unsigned payload is refused over the plaintext endpoint ${endpoint}"
+            S3FaultPresignTooLong(seconds)         =>
+                "s3: a presigned URL for ${seconds} seconds is past the seven-day ceiling"
+            S3FaultPartTooSmall(part, size)        =>
+                "s3: part ${part} is ${size} bytes, below the five-mebibyte floor"
+            S3FaultPartOutOfOrder(part, after)     =>
+                "s3: part ${part} follows part ${after} and the list must ascend"
+            S3FaultTruncatedBody(want, got)        =>
+                "s3: the body is ${got} bytes and the reply promised ${want}"
+            S3FaultBadXml(detail)                  => "s3: the reply is not the XML the operation defines: ${detail}"
+            S3FaultNoTlsTransport(endpoint)        =>
+                "s3: the shipped transport is plaintext-only and ${endpoint} is https"
+            S3FaultBadKey(key)                     => "s3: the key is empty or longer than 1024 bytes: ${key}"

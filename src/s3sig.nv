@@ -1,7 +1,5 @@
 // s3sig.nv — Signature Version 4, as arithmetic.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` THROUGHOUT, INSTANT INCLUDED.  Every function takes the moment
 // it signs for as a `CivilDateTime` argument.  That is not a purity
 // exercise: AWS publishes worked examples of SigV4 with a fixed
@@ -47,6 +45,107 @@
 use s3cfg
 use s3fault
 use s3req
+use std.bytes
+use std.list
+use std.str
+use hashing
+use arith
+use span
+use strfmt
+use civil
+
+// The first three links of the signing key's chain.
+fn service_key(secret: Str, s: S3Scope) -> Bytes
+    let k_date = hmac(bytes.from_str("AWS4" + secret), s.day)
+    let k_region = hmac(k_date, s.region)
+    hmac(k_region, s.service)
+
+// The whole chain, into a fresh buffer.
+fn derived_key(secret: Str, s: S3Scope) -> Bytes
+    hmac(service_key(secret, s), s.terminator)
+
+// HMAC-SHA256 of a string under a key, into a fresh 32-byte buffer.
+fn hmac(key: Bytes, msg: Str) -> Bytes
+    var out = bytes.zeros(32)
+    hashing.hmac_sha256(key, bytes.from_str(msg), var out)
+
+// Zero-padded decimal of a given width.
+fn padded(n: Int, width: Int) -> Str
+    str.pad_left(str.from_int(n), width, "0")
+
+fn two(n: Int) -> Str
+    padded(n, 2)
+
+fn four(n: Int) -> Str
+    padded(n, 4)
+
+fn epoch_seconds(t: CivilDateTime) -> Int
+    civil.epoch_day(t.date) * 86400 + t.time.hour * 3600 + t.time.minute * 60 + t.time.second
+
+// Percent-encode every byte outside `A-Za-z0-9-._~`, with uppercase
+// hex digits.  `keep_slash` leaves `/` alone, which is the one
+// difference between the canonical URI and the canonical query.  The
+// url-nv sets leave `!'()*` unencoded, and SigV4 encodes them, so the
+// set is spelled out here.
+fn encode(s: Str, keep_slash: Bool) -> Str
+    let n = str.len(s)
+    var buf = bytes.zeros(n * 3)
+    var o = 0
+    for i in 0..n
+        let c = str.byte_at_or(s, i, 0)
+        let plain = c >= 65 and c <= 90 or c >= 97 and c <= 122 or c >= 48 and c <= 57
+            or c == 45 or c == 46 or c == 95 or c == 126 or keep_slash and c == 47
+        if plain
+            bytes.set_u8(buf, o, c)
+            o = o + 1
+        else
+            bytes.set_u8(buf, o, 37)
+            bytes.set_u8(buf, o + 1, str.byte_at_or("0123456789ABCDEF", c >> 4, 48))
+            bytes.set_u8(buf, o + 2, str.byte_at_or("0123456789ABCDEF", c & 15, 48))
+            o = o + 3
+    bytes.to_str(bytes.slice(buf, 0, o))
+
+// A header value with the whitespace around it removed and every
+// internal run of spaces or tabs folded to one space.
+fn collapse(v: Str) -> Str
+    let t = str.trim(v)
+    var out = bytes.zeros(str.len(t))
+    var o = 0
+    var in_space = false
+    for i in 0..str.len(t)
+        let c = str.byte_at_or(t, i, 0)
+        if c == 32 or c == 9
+            if not in_space
+                bytes.set_u8(out, o, 32)
+                o = o + 1
+            in_space = true
+        else
+            bytes.set_u8(out, o, c)
+            o = o + 1
+            in_space = false
+    bytes.to_str(bytes.slice(out, 0, o))
+
+// The lowercased header names, each once, in sorted order.
+fn header_names(headers: [S3Header]) -> [Str]
+    var names: [Str] = []
+    for h in headers
+        let lower = str.lower(h.name)
+        if not list.contains(names, lower)
+            names = list.concat(names, [lower])
+    list.sort(names)
+    names
+
+// The headers a request is signed over: the caller's, then the ones the
+// signer adds.
+fn signing_headers(cfg: S3Config, r: S3Request, p: S3PayloadHash, at: CivilDateTime,
+                   host: Str) -> [S3Header]
+    var extra = [S3Header { name: "Host", value: host },
+                 S3Header { name: "x-amz-date", value: amz_date(at) },
+                 S3Header { name: "x-amz-content-sha256", value: payload_text(p) }]
+    if cfg.credentials.session_token != ""
+        extra = list.concat(extra, [S3Header { name: "x-amz-security-token",
+                                               value: cfg.credentials.session_token }])
+    list.concat(r.headers, extra)
 
 // The algorithm string, in the `Authorization` header and in the
 // string to sign.
@@ -149,20 +248,20 @@ pub struct S3Signature
 //     s3sig.amz_date(at)
 // ```
 pub fn amz_date(at: CivilDateTime) -> Str []
-    todo("s3-nv.s3sig.amz_date")
+    amz_day(at) + "T" + two(at.time.hour) + two(at.time.minute) + two(at.time.second) + "Z"
 
 // The `yyyymmdd` form the credential scope carries.
 pub fn amz_day(at: CivilDateTime) -> Str []
-    todo("s3-nv.s3sig.amz_day")
+    four(at.date.year) + two(at.date.month) + two(at.date.day)
 
 // The credential scope for an instant.
 pub fn scope(at: CivilDateTime, region: Str, service: Str) -> S3Scope []
-    todo("s3-nv.s3sig.scope")
+    S3Scope { day: amz_day(at), region: region, service: service, terminator: "aws4_request" }
 
 // A scope as the slash-joined string the `Credential` parameter
 // carries.
 pub fn scope_text(s: S3Scope) -> Str []
-    todo("s3-nv.s3sig.scope_text")
+    s.day + "/" + s.region + "/" + s.service + "/" + s.terminator
 
 // The payload hash a body implies, when it implies one.
 //
@@ -171,11 +270,18 @@ pub fn scope_text(s: S3Scope) -> Str []
 // hash.  `S3BodyStreamedUnhashed` answers `S3PayloadUnsigned`, which is
 // the honest translation and the one `payload_allowed` may refuse.
 pub fn payload_of_body(b: S3Body) -> S3PayloadHash []
-    todo("s3-nv.s3sig.payload_of_body")
+    match b
+        S3BodyNone                => S3PayloadSha256(S3_EMPTY_SHA256)
+        S3BodyBytes(data)         => S3PayloadSha256(bytes.to_hex(hashing.sha256(data)))
+        S3BodyStreamed(_, hex)    => S3PayloadSha256(hex)
+        S3BodyStreamedUnhashed(_) => S3PayloadUnsigned
 
 // The string `x-amz-content-sha256` carries for a payload hash.
 pub fn payload_text(p: S3PayloadHash) -> Str []
-    todo("s3-nv.s3sig.payload_text")
+    match p
+        S3PayloadSha256(hex)  => hex
+        S3PayloadUnsigned     => S3_UNSIGNED_PAYLOAD
+        S3PayloadStreaming(_) => S3_STREAMING_PAYLOAD
 
 // Whether this payload hash may be used against this endpoint.
 //
@@ -194,7 +300,13 @@ pub fn payload_text(p: S3PayloadHash) -> Str []
 //         None    => true
 // ```
 pub fn payload_allowed(p: S3PayloadHash, cfg: S3Config) -> ?S3Fault []
-    todo("s3-nv.s3sig.payload_allowed")
+    match p
+        S3PayloadUnsigned =>
+            if s3cfg.is_plaintext(cfg)
+                Some(S3FaultUnsignedOverPlaintext("${cfg.endpoint.scheme}://${cfg.endpoint.host}:${cfg.endpoint.port}"))
+            else
+                None
+        _                 => None
 
 // The canonical URI for a path.
 //
@@ -203,7 +315,7 @@ pub fn payload_allowed(p: S3PayloadHash, cfg: S3Config) -> ?S3Fault []
 // exception the specification writes out: every other AWS service
 // encodes the path twice.
 pub fn canonical_uri(path: Str) -> Str []
-    todo("s3-nv.s3sig.canonical_uri")
+    encode(path, true)
 
 // The canonical query string.
 //
@@ -213,7 +325,14 @@ pub fn canonical_uri(path: Str) -> Str []
 // produces a signature that is wrong for exactly the subresource
 // requests and right for everything else.
 pub fn canonical_query(pairs: [S3QueryPair]) -> Str []
-    todo("s3-nv.s3sig.canonical_query")
+    var keyed: [Str] = []
+    for p in pairs
+        keyed = list.concat(keyed, [encode(p.name, false) + "\n" + encode(p.value, false)])
+    list.sort(keyed)
+    var parts: [Str] = []
+    for k in keyed
+        parts = list.concat(parts, [str.replace(k, "\n", "=")])
+    str.join(parts, "&")
 
 // The canonical headers block.
 //
@@ -222,11 +341,18 @@ pub fn canonical_query(pairs: [S3QueryPair]) -> Str []
 // with a trailing newline.  Two headers of the same name are joined
 // with a comma in the order they were given.
 pub fn canonical_headers(headers: [S3Header]) -> Str []
-    todo("s3-nv.s3sig.canonical_headers")
+    var out = ""
+    for name in header_names(headers)
+        var values: [Str] = []
+        for h in headers
+            if str.lower(h.name) == name
+                values = list.concat(values, [collapse(h.value)])
+        out = out + name + ":" + str.join(values, ",") + "\n"
+    out
 
 // The `SignedHeaders` list for a header set.
 pub fn signed_headers(headers: [S3Header]) -> Str []
-    todo("s3-nv.s3sig.signed_headers")
+    str.join(header_names(headers), ";")
 
 // The complete canonical request for a request value.
 //
@@ -235,18 +361,30 @@ pub fn signed_headers(headers: [S3Header]) -> Str []
 // signature covers comes from `s3cfg.host_header`.
 pub fn canonical_request(cfg: S3Config, r: S3Request, p: S3PayloadHash,
                          at: CivilDateTime) -> Result<S3CanonicalRequest, S3Fault> []
-    todo("s3-nv.s3sig.canonical_request")
+    match s3cfg.host_header(cfg, r.bucket)
+        Err(f)   => Err(f)
+        Ok(host) =>
+            match s3cfg.canonical_path(cfg, r.bucket, r.key)
+                Err(f)   => Err(f)
+                Ok(path) =>
+                    let hs = signing_headers(cfg, r, p, at, host)
+                    Ok(S3CanonicalRequest { method: r.method, uri: canonical_uri(path),
+                                            query: canonical_query(r.query),
+                                            headers: canonical_headers(hs),
+                                            signed_headers: signed_headers(hs),
+                                            payload: payload_text(p) })
 
 // A canonical request as the six-part string that gets hashed.
 pub fn canonical_text(cr: S3CanonicalRequest) -> Str []
-    todo("s3-nv.s3sig.canonical_text")
+    cr.method + "\n" + cr.uri + "\n" + cr.query + "\n" + cr.headers + "\n" + cr.signed_headers + "\n" + cr.payload
 
 // The string to sign.
 //
 // Four lines: the algorithm, the `x-amz-date`, the scope, and the
 // lowercase hex SHA-256 of the canonical request.
 pub fn string_to_sign(cr: S3CanonicalRequest, at: CivilDateTime, s: S3Scope) -> Str []
-    todo("s3-nv.s3sig.string_to_sign")
+    S3_SIGV4_ALGORITHM + "\n" + amz_date(at) + "\n" + scope_text(s) + "\n"
+        + bytes.to_hex(hashing.sha256(bytes.from_str(canonical_text(cr))))
 
 // The signing key: four chained HMAC-SHA256s.
 //
@@ -259,17 +397,20 @@ pub fn string_to_sign(cr: S3CanonicalRequest, at: CivilDateTime, s: S3Scope) -> 
 // The digest is written into `out`, which the caller sizes at 32
 // bytes.  A `core`-shaped function that allocated its own answer would
 // be a function a device could not call.
-pub fn signing_key(secret: Str, s: S3Scope, out: Bytes) -> Result<Bytes, S3Fault> []
-    todo("s3-nv.s3sig.signing_key")
+pub fn signing_key(secret: Str, s: S3Scope, var out: Bytes) -> Result<Bytes, S3Fault> []
+    if bytes.len(out) != 32
+        Err(S3FaultBadEndpoint("the signing key buffer holds ${bytes.len(out)} bytes and an HMAC-SHA256 needs 32"))
+    else
+        Ok(hashing.hmac_sha256(service_key(secret, s), bytes.from_str(s.terminator), var out))
 
 // The day a signing key belongs to, for a cache to compare against.
 pub fn key_day_of(s: S3Scope) -> Str []
-    todo("s3-nv.s3sig.key_day_of")
+    s.day
 
 // The signature: HMAC of the string to sign under the signing key,
 // lowercase hex.
 pub fn sign(key: Bytes, sts: Str) -> Str []
-    todo("s3-nv.s3sig.sign")
+    bytes.to_hex(hmac(key, sts))
 
 // The whole of it: a request, an instant, and the header that
 // authorises it.
@@ -290,7 +431,19 @@ pub fn sign(key: Bytes, sts: Str) -> Str []
 // ```
 pub fn authorize(cfg: S3Config, r: S3Request, p: S3PayloadHash,
                  at: CivilDateTime) -> Result<S3Signature, S3Fault> []
-    todo("s3-nv.s3sig.authorize")
+    match payload_allowed(p, cfg)
+        Some(f) => Err(f)
+        None    =>
+            match canonical_request(cfg, r, p, at)
+                Err(f) => Err(f)
+                Ok(cr) =>
+                    let s = scope(at, cfg.region, cfg.service)
+                    let hex = sign(derived_key(cfg.credentials.secret_access_key, s), string_to_sign(cr, at, s))
+                    let header = S3_SIGV4_ALGORITHM + " Credential=" + cfg.credentials.access_key_id
+                        + "/" + scope_text(s) + ", SignedHeaders=" + cr.signed_headers
+                        + ", Signature=" + hex
+                    Ok(S3Signature { hex: hex, header: header, amz_date: amz_date(at),
+                                     payload: cr.payload })
 
 // The headers a signature adds to a request, in send order.
 //
@@ -300,7 +453,12 @@ pub fn authorize(cfg: S3Config, r: S3Request, p: S3PayloadHash,
 // and no others: an extra header the signature did not cover is fine,
 // and a MISSING one that `SignedHeaders` names is a 403.
 pub fn authorization_headers(cfg: S3Config, sig: S3Signature) -> [S3Header] []
-    todo("s3-nv.s3sig.authorization_headers")
+    var out = [S3Header { name: "x-amz-date", value: sig.amz_date },
+               S3Header { name: "x-amz-content-sha256", value: sig.payload }]
+    if cfg.credentials.session_token != ""
+        out = list.concat(out, [S3Header { name: "x-amz-security-token",
+                                           value: cfg.credentials.session_token }])
+    list.concat(out, [S3Header { name: "Authorization", value: sig.header }])
 
 // A presigned URL, valid for `seconds`.
 //
@@ -327,14 +485,49 @@ pub fn authorization_headers(cfg: S3Config, sig: S3Signature) -> [S3Header] []
 // ```
 pub fn presign(cfg: S3Config, r: S3Request, seconds: Int,
                at: CivilDateTime) -> Result<Str, S3Fault> []
-    todo("s3-nv.s3sig.presign")
+    if seconds < 1 or seconds > S3_PRESIGN_MAX_SECONDS
+        Err(S3FaultPresignTooLong(seconds))
+    else
+        match s3cfg.host_header(cfg, r.bucket)
+            Err(f)   => Err(f)
+            Ok(host) =>
+                match s3cfg.canonical_path(cfg, r.bucket, r.key)
+                    Err(f)   => Err(f)
+                    Ok(path) =>
+                        let s = scope(at, cfg.region, cfg.service)
+                        let hs = list.concat([S3Header { name: "Host", value: host }], r.headers)
+                        let signed = signed_headers(hs)
+                        var q = list.concat(r.query, [
+                            S3QueryPair { name: "X-Amz-Algorithm", value: S3_SIGV4_ALGORITHM },
+                            S3QueryPair { name: "X-Amz-Credential",
+                                          value: cfg.credentials.access_key_id + "/" + scope_text(s) },
+                            S3QueryPair { name: "X-Amz-Date", value: amz_date(at) },
+                            S3QueryPair { name: "X-Amz-Expires", value: str.from_int(seconds) },
+                            S3QueryPair { name: "X-Amz-SignedHeaders", value: signed }])
+                        if cfg.credentials.session_token != ""
+                            q = list.concat(q, [S3QueryPair { name: "X-Amz-Security-Token",
+                                                              value: cfg.credentials.session_token }])
+                        let cr = S3CanonicalRequest { method: r.method, uri: canonical_uri(path),
+                                                      query: canonical_query(q),
+                                                      headers: canonical_headers(hs),
+                                                      signed_headers: signed,
+                                                      payload: S3_UNSIGNED_PAYLOAD }
+                        let hex = sign(derived_key(cfg.credentials.secret_access_key, s),
+                            string_to_sign(cr, at, s))
+                        Ok(cfg.endpoint.scheme + "://" + host + cr.uri + "?" + cr.query
+                           + "&X-Amz-Signature=" + hex)
 
 // When a presigned URL stops working.
 //
 // Answers the instant, so a caller can put it in a UI rather than
 // making its user discover the expiry by clicking.
 pub fn presign_expiry(at: CivilDateTime, seconds: Int) -> Result<CivilDateTime, S3Fault> []
-    todo("s3-nv.s3sig.presign_expiry")
+    if seconds < 1 or seconds > S3_PRESIGN_MAX_SECONDS
+        Err(S3FaultPresignTooLong(seconds))
+    else
+        match arith.add_delta(at, span.seconds(seconds))
+            Ok(t)  => Ok(t)
+            Err(_) => Err(S3FaultPresignTooLong(seconds))
 
 // Whether two instants are close enough for a signature to verify.
 //
@@ -343,7 +536,12 @@ pub fn presign_expiry(at: CivilDateTime, seconds: Int) -> Result<CivilDateTime, 
 // wrong" instead of "access denied", which is the difference between a
 // five-second fix and a support ticket.
 pub fn skew_ok(signed_at: CivilDateTime, service_at: CivilDateTime) -> Bool []
-    todo("s3-nv.s3sig.skew_ok")
+    let d = epoch_seconds(signed_at) - epoch_seconds(service_at)
+    let gap = if d < 0
+        0 - d
+    else
+        d
+    gap <= S3_CLOCK_SKEW_SECONDS
 
 // The service's clock, out of a reply's `Date` header.
 //
@@ -351,4 +549,9 @@ pub fn skew_ok(signed_at: CivilDateTime, service_at: CivilDateTime) -> Bool []
 // and the reason it is here rather than in `s3req`: an RFC 1123 date
 // is the only date format in this package that is not calendar-nv's.
 pub fn service_time_of(headers: [Str]) -> ?CivilDateTime []
-    todo("s3-nv.s3sig.service_time_of")
+    match s3req.header_of(headers, "date")
+        None    => None
+        Some(v) =>
+            match strfmt.parse(v, "%a, %d %b %Y %H:%M:%S GMT")
+                Ok(t)  => Some(t)
+                Err(_) => None
